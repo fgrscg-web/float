@@ -1,0 +1,1483 @@
+import sys
+import os
+import io
+import traceback
+import datetime
+import numpy as np
+import pandas as pd
+import ezdxf
+import matplotlib
+import matplotlib.pyplot as plt
+from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas, \
+    NavigationToolbar2QT as NavigationToolbar
+from matplotlib.figure import Figure
+from matplotlib import rcParams, cm
+from matplotlib.ticker import FuncFormatter
+
+from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
+                               QPushButton, QLabel, QTextEdit, QFileDialog, QLineEdit,
+                               QHBoxLayout, QScrollArea, QFrame, QSplitter, QComboBox,
+                               QInputDialog, QMessageBox, QProgressDialog)
+from PySide6.QtGui import QTextCursor, QIcon
+from PySide6.QtCore import Qt
+
+from shapely.geometry import LineString, Polygon, Point, box
+from shapely.ops import unary_union, polygonize, split, nearest_points, snap
+import shapely.affinity as affinity
+from shapely.strtree import STRtree
+from shapely.prepared import prep
+
+# Matplotlib 설정
+matplotlib.use('QtAgg')
+rcParams['font.family'] = 'Malgun Gothic'
+rcParams['axes.unicode_minus'] = False
+
+class UltimateShipAnalyzer(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("FloatCalc - Complete 1D Extraction & Node Detection")
+        self.resize(2000, 1200)
+        self.saved_frames_data = []
+        self.current_dxf_path = ""
+        self.reset_analysis_data()
+        self.init_ui()
+
+    def reset_analysis_data(self):
+        self.raw_1999_lines = []
+        self.left_1999_segments = []
+        self.lines_1102_raw = []
+        self.lines_1102 = []
+        self.lines_157 = []
+        self.lines_6001 = []
+        self.lines_7001 = []
+        self.lines_9001 = []
+        self.lines_minus1204 = []
+        self.hull_centroid = Point(0, 0)
+        self.shell_thickness_inputs = []
+        
+        self.calculated_polygons = [] 
+        self.poly_layer_map = {}      
+        
+        self.is_calculated = False
+        self.shear_flows = []
+        self.mesh_cells = []
+        
+        self.centerlines = [] 
+        self.nodes = []
+        self.single_nodes = []
+        self.merged_nodes = []
+        
+        self.topological_nodes = []
+        self.topological_edges = []
+        
+        self.max_shell_q_idx = -1
+        self.max_shell_thk = 0.0
+        self.q_per_v = 0.0
+        self.max_Q = 0.0
+        self.calc_na_bl = 0.0
+        self.calc_depth = 0.0
+        self.base_report = ""
+        self.act_fb = 0.0
+        self.act_fs = 0.0
+        self.allow_fb = 0.0
+        self.allow_fs = 0.0
+        self.raw_swbm = 0.0
+        self.raw_shear = 0.0
+
+    def init_ui(self):
+        main_scroll = QScrollArea()
+        main_scroll.setWidgetResizable(True)
+        main_container = QWidget()
+        main_layout = QHBoxLayout(main_container)
+
+        self.input_style = "background-color: white; color: black; border: 1px solid #ABB2B9; padding: 2px;"
+        self.field_width = 100
+
+        control_panel = QWidget()
+        control_panel.setFixedWidth(300)
+        control_panel_layout = QVBoxLayout(control_panel)
+        control_panel_layout.setAlignment(Qt.AlignTop)
+
+        gen_box = QFrame()
+        gen_box.setStyleSheet("background: #F2F4F4; border-radius: 5px; padding: 5px;")
+        gen_vbox = QVBoxLayout(gen_box)
+        gen_vbox.addWidget(QLabel("<b>[General Settings]</b>"))
+        for lbl, attr, dval in [("Scale:", "txt_scale", "100"), ("H-Ext (mm):", "txt_ext", "10"),
+                                ("V-Ext (mm):", "txt_perp", "10")]:
+            h = QHBoxLayout()
+            h.addWidget(QLabel(lbl))
+            h.addStretch()
+            le = QLineEdit(dval)
+            le.setFixedWidth(self.field_width)
+            le.setStyleSheet(self.input_style)
+            setattr(self, attr, le)
+            h.addWidget(le)
+            gen_vbox.addLayout(h)
+        control_panel_layout.addWidget(gen_box)
+
+        self.btn_load = QPushButton("1. DXF Load 📂")
+        self.btn_load.setFixedHeight(40)
+        self.btn_load.setStyleSheet(
+            "background-color: #2E86C1; color: white; font-weight: bold; margin-top: 5px; margin-bottom: 5px;")
+        self.btn_load.clicked.connect(self.load_and_process_dxf)
+        control_panel_layout.addWidget(self.btn_load)
+
+        struct_box = QFrame()
+        struct_box.setStyleSheet("background: #FEF9E7; border-radius: 5px; padding: 5px;")
+        struct_vbox = QVBoxLayout(struct_box)
+        struct_vbox.addWidget(QLabel("<b>[Structural Category]</b>"))
+        for lbl, attr, items in [
+            ("Selection window:", "combo_section", ["continuous section", "discontinuous section"]),
+            ("creation window:", "combo_hull", ["mild", "H.T", "H.T with BKT"])]:
+            h = QHBoxLayout()
+            h.addWidget(QLabel(lbl))
+            h.addStretch()
+            cb = QComboBox()
+            cb.addItems(items)
+            cb.setFixedWidth(self.field_width)
+            cb.setStyleSheet(self.input_style)
+            setattr(self, attr, cb)
+            h.addWidget(cb)
+            struct_vbox.addLayout(h)
+        control_panel_layout.addWidget(struct_box)
+
+        shear_box = QFrame()
+        shear_box.setStyleSheet("background: #EBF5FB; border-radius: 5px; padding: 5px; margin-top: 10px;")
+        shear_vbox = QVBoxLayout(shear_box)
+        shear_vbox.addWidget(QLabel("<b>[Loading Setting]</b>"))
+        for lbl, attr, dval in [("S.W.B.M (tm):", "txt_swbm", "0"), ("Shear (t):", "txt_shear_v", "10"),
+                                ("Grade (K):", "txt_grade_k", "1.00")]:
+            h = QHBoxLayout()
+            h.addWidget(QLabel(lbl))
+            h.addStretch()
+            le = QLineEdit(dval)
+            le.setFixedWidth(self.field_width)
+            le.setStyleSheet(self.input_style)
+            setattr(self, attr, le)
+            h.addWidget(le)
+            shear_vbox.addLayout(h)
+        control_panel_layout.addWidget(shear_box)
+
+        control_panel_layout.addWidget(QLabel("<b>[S/SHELL Thickness (mm)]</b>"))
+        self.thickness_scroll = QScrollArea()
+        self.thickness_scroll.setWidgetResizable(True)
+        self.thickness_scroll.setMinimumHeight(200)
+        self.scroll_content = QWidget()
+        self.thickness_layout = QVBoxLayout(self.scroll_content)
+        self.thickness_layout.setAlignment(Qt.AlignTop)
+        self.thickness_scroll.setWidget(self.scroll_content)
+        control_panel_layout.addWidget(self.thickness_scroll)
+
+        self.btn_calc = QPushButton("2. Cross Section Analysis 🧮")
+        self.btn_calc.setFixedHeight(50)
+        self.btn_calc.setStyleSheet(
+            "background-color: #28B463; color: white; font-weight: bold; font-size: 14px; margin-top: 5px;")
+        self.btn_calc.clicked.connect(self.calculate_total_inertia)
+        control_panel_layout.addWidget(self.btn_calc)
+
+        eval_box = QFrame()
+        eval_box.setStyleSheet("background: #FADBD8; border-radius: 5px; padding: 5px; margin-top: 10px;")
+        eval_vbox = QVBoxLayout(eval_box)
+        eval_vbox.addWidget(QLabel("<b>[Post-Calc Evaluation]</b>"))
+        h_mat = QHBoxLayout()
+        h_mat.addWidget(QLabel("Material:"))
+        h_mat.addStretch()
+        self.combo_material_type = QComboBox()
+        self.combo_material_type.addItems(["Mild", "H.T", "H.T with BKT"])
+        self.combo_material_type.setFixedWidth(self.field_width)
+        h_mat.addWidget(self.combo_material_type)
+        eval_vbox.addLayout(h_mat)
+
+        self.btn_eval = QPushButton("3. STRENGTH Analysis ⛓️")
+        self.btn_eval.setFixedHeight(40)
+        self.btn_eval.setStyleSheet("background-color: #E67E22; color: white; font-weight: bold;")
+        self.btn_eval.setEnabled(False)
+        self.btn_eval.clicked.connect(self.evaluate_strength)
+        eval_vbox.addWidget(self.btn_eval)
+        control_panel_layout.addWidget(eval_box)
+
+        main_layout.addWidget(control_panel)
+
+        work_area = QWidget()
+        work_layout = QVBoxLayout(work_area)
+        viz_splitter = QSplitter(Qt.Horizontal)
+        for i, title in enumerate(["[Cross Section View]", "[1D Lines & Nodes]"]):
+            container = QWidget()
+            lay = QVBoxLayout(container)
+            lay.addWidget(QLabel(f"<b>{title}</b>"))
+            fig = Figure()
+            can = FigureCanvas(fig)
+            lay.addWidget(NavigationToolbar(can, self))
+            lay.addWidget(can, stretch=1)
+            setattr(self, f"fig{i + 1}", fig)
+            setattr(self, f"can{i + 1}", can)
+            viz_splitter.addWidget(container)
+        work_layout.addWidget(viz_splitter, stretch=7)
+
+        self.result_box = QTextEdit()
+        self.result_box.setReadOnly(True)
+        self.result_box.setFixedHeight(270)
+        self.result_box.setStyleSheet("font-family: 'Consolas'; font-size: 13px;")
+        work_layout.addWidget(self.result_box)
+        main_layout.addWidget(work_area, stretch=7)
+
+        history_panel = QWidget()
+        history_panel.setFixedWidth(300)
+        history_layout = QVBoxLayout(history_panel)
+        history_layout.setAlignment(Qt.AlignTop)
+        history_layout.addWidget(QLabel("<b>[Saved Frames for Excel]</b>"))
+
+        self.history_scroll = QScrollArea()
+        self.history_scroll.setWidgetResizable(True)
+        self.history_content = QWidget()
+        self.history_list_layout = QVBoxLayout(self.history_content)
+        self.history_list_layout.setAlignment(Qt.AlignTop)
+        self.history_scroll.setWidget(self.history_content)
+        history_layout.addWidget(self.history_scroll, stretch=1)
+
+        self.btn_save_frame = QPushButton("4. Add Frame to List 💾")
+        self.btn_save_frame.setFixedHeight(40)
+        self.btn_save_frame.setStyleSheet("background-color: #3498DB; color: white; font-weight: bold;")
+        self.btn_save_frame.clicked.connect(self.save_current_frame)
+        self.btn_save_frame.setEnabled(False)
+        history_layout.addWidget(self.btn_save_frame)
+
+        self.btn_export_excel = QPushButton("5. Export All to Excel 📊")
+        self.btn_export_excel.setFixedHeight(40)
+        self.btn_export_excel.setStyleSheet(
+            "background-color: #1E8449; color: white; font-weight: bold; margin-top: 5px;")
+        self.btn_export_excel.clicked.connect(self.export_to_excel)
+        history_layout.addWidget(self.btn_export_excel)
+
+        main_layout.addWidget(history_panel)
+        main_scroll.setWidget(main_container)
+        self.setCentralWidget(main_scroll)
+
+    def _extract_pts(self, e, scale):
+        try:
+            if e.dxftype() == 'LINE':
+                return [(e.dxf.start.x * scale, e.dxf.start.y * scale), (e.dxf.end.x * scale, e.dxf.end.y * scale)]
+            elif e.dxftype() in ('LWPOLYLINE', 'POLYLINE'):
+                return [(p[0] * scale, p[1] * scale) for p in e.get_points()]
+        except:
+            return None
+        return None
+
+    def heal_1102_collinear(self, lines_1102, threshold_gap=150.0):
+        if not lines_1102: return []
+        new_bridges = []
+        groups = {}
+        for l in lines_1102:
+            c = list(l.coords)
+            p1, p2 = np.array(c[0]), np.array(c[-1])
+            v = p2 - p1
+            L = np.linalg.norm(v)
+            if L < 1e-6: continue
+            ang = np.degrees(np.arctan2(v[1], v[0])) % 180.0
+            ang_key = round(ang, 0)
+            theta = np.radians(ang_key)
+            rho = -p1[0] * np.sin(theta) + p1[1] * np.cos(theta)
+            rho_key = round(rho / 10.0) * 10.0
+            key = (ang_key, rho_key)
+            if key not in groups: groups[key] = []
+            groups[key].append((l, p1, p2))
+
+        for (ang_key, rho_key), group in groups.items():
+            if len(group) < 2: continue
+            dir_vec = np.array([np.cos(np.radians(ang_key)), np.sin(np.radians(ang_key))])
+            segs = sorted([(np.dot(p1, dir_vec), np.dot(p2, dir_vec), p1, p2) for _, p1, p2 in group],
+                          key=lambda x: min(x[0], x[1]))
+            for i in range(len(segs) - 1):
+                p_end = segs[i][2] if segs[i][0] > segs[i][1] else segs[i][3]
+                p_next_start = segs[i + 1][3] if segs[i + 1][0] > segs[i + 1][1] else segs[i + 1][2]
+                gap_dist = np.linalg.norm(p_next_start - p_end)
+                if 0.1 < gap_dist <= threshold_gap:
+                    new_bridges.append(LineString([tuple(p_end), tuple(p_next_start)]))
+        return lines_1102 + new_bridges
+
+    def heal_157_segments(self, lines_157, lines_1999, threshold_gap=150.0):
+        if not lines_157: return []
+        lines = lines_157 + lines_1999
+        healed = list(lines_157)
+        new_bridges = []
+        groups = {}
+        for l in lines:
+            p1, p2 = np.array(l.coords[0]), np.array(l.coords[-1])
+            v = p2 - p1
+            L = np.linalg.norm(v)
+            if L < 1e-6: continue
+            ang = np.degrees(np.arctan2(v[1], v[0])) % 180.0
+            ang_key = round(ang, 1)
+            theta = np.radians(ang_key)
+            rho = -p1[0] * np.sin(theta) + p1[1] * np.cos(theta)
+            key = (ang_key, round(rho, 0))
+            if key not in groups: groups[key] = []
+            groups[key].append((l, p1, p2))
+
+        for (ang, rho), group in groups.items():
+            dir_vec = np.array([np.cos(np.radians(ang)), np.sin(np.radians(ang))])
+            segs = sorted([(np.dot(p1, dir_vec), np.dot(p2, dir_vec), p1, p2) for _, p1, p2 in group],
+                          key=lambda x: min(x[0], x[1]))
+            for i in range(len(segs) - 1):
+                p_end = segs[i][2] if segs[i][0] > segs[i][1] else segs[i][3]
+                p_next_start = segs[i + 1][3] if segs[i + 1][0] > segs[i + 1][1] else segs[i + 1][2]
+                if 0 < np.linalg.norm(p_next_start - p_end) <= threshold_gap:
+                    new_bridges.append(LineString([tuple(p_end), tuple(p_next_start)]))
+
+        open_info = []
+        for l in lines:
+            c = list(l.coords)
+            ps, pe = np.array(c[0]), np.array(c[-1])
+            v_s = (ps - np.array(c[1]) if len(c) > 1 else ps - pe)
+            v_e = (pe - np.array(c[-2]) if len(c) > 1 else pe - ps)
+            open_info.append(((round(ps[0], 3), round(ps[1], 3)), ps, v_s / (np.linalg.norm(v_s) + 1e-9), l))
+            open_info.append(((round(pe[0], 3), round(pe[1], 3)), pe, v_e / (np.linalg.norm(v_e) + 1e-9), l))
+
+        connected = set()
+        for i in range(len(open_info)):
+            r1, p1, d1, l1 = open_info[i]
+            if r1 in connected: continue
+            best_j, min_d = -1, float('inf')
+            for j in range(len(open_info)):
+                if i == j or open_info[j][0] in connected or l1 is open_info[j][3]: continue
+                r2, p2, d2, _ = open_info[j]
+                gap_v = p2 - p1
+                dist = np.linalg.norm(gap_v)
+                if 1.0 < dist <= 150.0 and np.dot(d1, gap_v / dist) > -0.5 and np.dot(d2, -gap_v / dist) > -0.5:
+                    if dist < min_d: min_d = dist; best_j = j
+            if best_j != -1:
+                new_bridges.append(LineString([tuple(p1), tuple(open_info[best_j][1])]))
+                connected.update([r1, open_info[best_j][0]])
+
+        final_open = [p for r, p, d, l in open_info if r not in connected and l not in lines_1999]
+        if final_open and lines_1999:
+            all_target = unary_union(healed + new_bridges + lines_1999)
+            for p in final_open:
+                nt = nearest_points(Point(p), all_target)[1]
+                if 1.0 < Point(p).distance(nt) <= 100.0:
+                    new_bridges.append(LineString([tuple(p), (nt.x, nt.y)]))
+
+        return healed + new_bridges
+
+    def generate_outward_thickness(self, line, thickness):
+        try:
+            coords = list(line.coords)
+            p1, p2 = np.array(coords[0]), np.array(coords[-1])
+            v = p2 - p1
+            length = np.linalg.norm(v)
+            if length == 0: return line.buffer(thickness / 2.0)
+            nx, ny = -(v[1] / length), v[0] / length
+            cx, cy = self.hull_centroid.x, self.hull_centroid.y
+            mx, my = (p1[0] + p2[0]) / 2.0, (p1[1] + p2[1]) / 2.0
+            if (nx * (mx - cx) + ny * (my - cy)) < 0: nx, ny = -nx, -ny
+            new_coords = coords + [(p[0] + nx * thickness, p[1] + ny * thickness) for p in reversed(coords)]
+            return Polygon(new_coords)
+        except:
+            return line.buffer(thickness / 2.0)
+
+    def apply_original_algorithm(self, target_lines, shell_lines, ext, perp, max_a):
+        if not target_lines: return []
+        all_l = target_lines + shell_lines
+        ends_dict = {}
+        for l in all_l:
+            for pt in [l.coords[0], l.coords[-1]]:
+                p_rnd = (round(pt[0], 3) + 0.0, round(pt[1], 3) + 0.0)
+                ends_dict[p_rnd] = ends_dict.get(p_rnd, 0) + 1
+        ends = {k for k, v in ends_dict.items() if v == 1}
+
+        ext_l, p_lines = [], []
+        for l in all_l:
+            c = list(l.coords)
+            p_s, p_n = np.array(c[0]), np.array(c[1])
+            p_l, p_p = np.array(c[-1]), np.array(c[-2])
+
+            p_s_rnd = (round(p_s[0], 3) + 0.0, round(p_s[1], 3) + 0.0)
+            p_l_rnd = (round(p_l[0], 3) + 0.0, round(p_l[1], 3) + 0.0)
+
+            if p_s_rnd in ends:
+                diff = p_s - p_n
+                norm = np.linalg.norm(diff) + 1e-9
+                v_s = diff / norm
+                c[0] = tuple(p_s + v_s * ext)
+                n = np.array([-v_s[1], v_s[0]])
+                p_lines.append(LineString([tuple(p_s + n * perp), p_s, tuple(p_s - n * perp)]))
+
+            if p_l_rnd in ends:
+                diff = p_l - p_p
+                norm = np.linalg.norm(diff) + 1e-9
+                v_e = diff / norm
+                c[-1] = tuple(p_l + v_e * ext)
+                n = np.array([-v_e[1], v_e[0]])
+                p_lines.append(LineString([tuple(p_l + n * perp), p_l, tuple(p_l - n * perp)]))
+
+            ext_l.append(LineString(c))
+
+        f_net = unary_union(ext_l + p_lines + shell_lines)
+        c_polys = list(polygonize(f_net))
+        return [p for p in c_polys if 1e-3 < p.area < max_a]
+
+    def load_and_process_dxf(self):
+        fname, _ = QFileDialog.getOpenFileName(self, 'Select DXF File', '', 'DXF files (*.dxf)')
+        if not fname: return
+        self.reset_analysis_data()
+        self.result_box.clear()
+        self.current_dxf_path = fname
+        try:
+            scale = float(self.txt_scale.text())
+            try:
+                doc = ezdxf.readfile(fname, encoding='utf-8')
+            except Exception:
+                doc = ezdxf.readfile(fname, encoding='cp949')
+                
+            msp = doc.modelspace()
+            active_layers = {l.dxf.name for l in doc.layers if l.is_on() and not l.is_frozen()}
+            t_1999, t_minus1204 = [], []
+            t_layers = {"-1102": [], "157": [], "6001": [], "7001": [], "9001": []}
+
+            for e in msp:
+                layer = e.dxf.layer.strip()
+                if layer not in active_layers: continue
+                pts = self._extract_pts(e, scale)
+                if not pts or len(pts) < 2: continue
+                ls = LineString(pts)
+                if layer == "1999":
+                    t_1999.append(ls)
+                elif layer == "-1204":
+                    t_minus1204.append(ls)
+                elif layer in t_layers:
+                    t_layers[layer].append(ls)
+
+            if t_1999:
+                u_1999 = unary_union(t_1999)
+                self.cx, self.cy_base = u_1999.centroid.x, u_1999.bounds[1]
+            else:
+                self.cx = self.cy_base = 0.0
+
+            shift = lambda ls: LineString([(p[0] - self.cx, p[1] - self.cy_base) for p in ls.coords])
+            self.raw_1999_lines = [shift(ls) for ls in t_1999]
+            self.lines_minus1204 = [shift(ls) for ls in t_minus1204]
+            
+            m_1999 = unary_union(self.raw_1999_lines)
+            self.hull_centroid = m_1999.centroid
+            cutters = [LineString([tuple(np.array(c.coords[0]) - 20), tuple(np.array(c.coords[-1]) + 20)]) for c in self.lines_minus1204]
+            split_res = split(m_1999, unary_union(cutters)) if cutters else m_1999
+            pieces = list(split_res.geoms) if hasattr(split_res, 'geoms') else [split_res]
+            self.left_1999_segments = sorted([g for g in pieces if g.centroid.x <= 0.1 and g.length > 0.1],
+                                             key=lambda s: (-round(s.centroid.y, 2), s.centroid.x))
+
+            self.lines_1102_raw = [shift(ls) for ls in t_layers["-1102"]]
+            self.lines_157 = [shift(ls) for ls in t_layers["157"]]
+            self.lines_6001 = [shift(ls) for ls in t_layers["6001"]]
+            self.lines_7001 = [shift(ls) for ls in t_layers["7001"]]
+            self.lines_9001 = [shift(ls) for ls in t_layers["9001"]]
+            self.refresh_ui()
+            self.result_box.append(f"✅ Successfully loaded: {os.path.basename(fname)}")
+        except Exception as e:
+            self.result_box.setText(f"❌ Load Error Detailed:\n{traceback.format_exc()}")
+
+    def calculate_total_inertia(self):
+        progress = QProgressDialog("Complete 1D Extraction...", "Cancel", 0, 100, self)
+        progress.setWindowTitle("Processing")
+        progress.setWindowModality(Qt.WindowModal)
+        progress.setAutoClose(False)
+        progress.show()
+        QApplication.processEvents()
+
+        def filter_short_segments(lines, min_length=30.0):
+            return [l for l in lines if l.length >= min_length]
+        
+        def split_line_by_angle(line, angle_threshold=1.0):
+            coords = list(line.coords)
+            if len(coords) < 3: return [line]
+            segments = []
+            current_segment = [coords[0]]
+            for i in range(1, len(coords) - 1):
+                current_segment.append(coords[i])
+                v1 = np.array(coords[i]) - np.array(coords[i-1])
+                v2 = np.array(coords[i+1]) - np.array(coords[i])
+                l1, l2 = np.linalg.norm(v1), np.linalg.norm(v2)
+                if l1 < 1e-6 or l2 < 1e-6: continue
+                cos_theta = np.clip(np.dot(v1, v2) / (l1 * l2), -1.0, 1.0)
+                angle = np.degrees(np.arccos(cos_theta))
+                if angle >= angle_threshold:
+                    segments.append(LineString(current_segment))
+                    current_segment = [coords[i]]
+            current_segment.append(coords[-1])
+            if len(current_segment) >= 2:
+                segments.append(LineString(current_segment))
+            return segments
+
+        def perpendicular_distance(point, line_start, line_end):
+            p = np.array(point)
+            a = np.array(line_start)
+            b = np.array(line_end)
+            ab = b - a
+            ab_len = np.linalg.norm(ab)
+            if ab_len < 1e-9:
+                return np.linalg.norm(p - a)
+            ab_unit = ab / ab_len
+            ap = p - a
+            proj_len = np.dot(ap, ab_unit)
+            if proj_len < 0:
+                return np.linalg.norm(p - a)
+            elif proj_len > ab_len:
+                return np.linalg.norm(p - b)
+            else:
+                proj_point = a + proj_len * ab_unit
+                return np.linalg.norm(p - proj_point)
+        
+        def match_parallel_pairs_robust(lines, max_distance=100.0):
+            if not lines: return []
+            potential_pairs = []
+            sorted_lines = sorted(lines, key=lambda x: x.length, reverse=True)
+            covered_intervals = {i: [] for i in range(len(sorted_lines))}
+            
+            for i, line1 in enumerate(sorted_lines):
+                c1 = list(line1.coords)
+                p1_start, p1_end = np.array(c1[0]), np.array(c1[-1])
+                v1 = p1_end - p1_start
+                len1 = np.linalg.norm(v1)
+                if len1 < 1e-6: continue
+                angle1 = np.degrees(np.arctan2(v1[1], v1[0])) % 180
+                v1_unit = v1 / len1
+                
+                for j, line2 in enumerate(sorted_lines):
+                    if i == j: continue
+                    c2 = list(line2.coords)
+                    p2_start, p2_end = np.array(c2[0]), np.array(c2[-1])
+                    v2 = p2_end - p2_start
+                    len2 = np.linalg.norm(v2)
+                    if len2 < 1e-6: continue
+                    angle2 = np.degrees(np.arctan2(v2[1], v2[0])) % 180
+                    angle_diff = min(abs(angle1 - angle2), 180 - abs(angle1 - angle2))
+                    if angle_diff > 5: continue
+                    d1 = perpendicular_distance(p2_start, p1_start, p1_end)
+                    d2 = perpendicular_distance(p2_end, p1_start, p1_end)
+                    avg_dist = (d1 + d2) / 2.0
+                    if avg_dist > max_distance: continue
+                    
+                    proj2_start = np.dot(p2_start - p1_start, v1_unit)
+                    proj2_end = np.dot(p2_end - p1_start, v1_unit)
+                    if proj2_start > proj2_end:
+                        proj2_start, proj2_end = proj2_end, proj2_start
+                    overlap_start = max(0, proj2_start)
+                    overlap_end = min(len1, proj2_end)
+                    
+                    if overlap_start < overlap_end - 1e-3 and (overlap_end - overlap_start > 30.0):
+                        overlap_flag = False
+                        for (cs, ce) in covered_intervals[i]:
+                            if max(overlap_start, cs) < min(overlap_end, ce) - 1e-3:
+                                overlap_flag = True; break
+                        if overlap_flag: continue
+                        
+                        v2_unit = v2 / len2
+                        proj1_start_l2 = np.dot(p1_start - p2_start, v2_unit)
+                        proj1_end_l2 = np.dot(p1_end - p2_start, v2_unit)
+                        if proj1_start_l2 > proj1_end_l2:
+                            proj1_start_l2, proj1_end_l2 = proj1_end_l2, proj1_start_l2
+                        ov2_start = max(0, proj1_start_l2)
+                        ov2_end = min(len2, proj1_end_l2)
+                        
+                        for (cs, ce) in covered_intervals[j]:
+                            if max(ov2_start, cs) < min(ov2_end, ce) - 1e-3:
+                                overlap_flag = True; break
+                        if overlap_flag: continue
+                        
+                        covered_intervals[i].append((overlap_start, overlap_end))
+                        covered_intervals[j].append((ov2_start, ov2_end))
+                        seg1_start = p1_start + v1_unit * overlap_start
+                        seg1_end = p1_start + v1_unit * overlap_end
+                        seg2_start = p2_start + v2_unit * ov2_start
+                        seg2_end = p2_start + v2_unit * ov2_end
+                        potential_pairs.append({
+                            'line1': LineString([tuple(seg1_start), tuple(seg1_end)]), 
+                            'line2': LineString([tuple(seg2_start), tuple(seg2_end)]), 
+                            'distance': avg_dist
+                        })
+            
+            return [(p['line1'], p['line2'], p['distance']) for p in potential_pairs]
+        
+        def generate_centerline_from_pair(line1, line2, distance):
+            c1 = list(line1.coords)
+            c2 = list(line2.coords)
+            center_coords = []
+            for i in range(max(len(c1), len(c2))):
+                p1 = np.array(c1[min(i, len(c1)-1)])
+                p2 = np.array(c2[min(i, len(c2)-1)])
+                center_coords.append(tuple((p1 + p2) / 2.0))
+            
+            centerline = LineString(center_coords) if len(center_coords) >= 2 else line1
+            vec = np.array(centerline.coords[-1]) - np.array(centerline.coords[0])
+            angle = np.degrees(np.arctan2(vec[1], vec[0])) % 180
+            is_horiz = (angle < 3 or angle > 177)
+            is_vert = (87 < angle < 93)
+            
+            if is_horiz or is_vert:
+                thickness = distance
+            else:
+                coords = list(centerline.coords)
+                mid_idx = len(coords) // 2
+                dists = []
+                for pt in [coords[0], coords[mid_idx], coords[-1]]:
+                    dd1 = perpendicular_distance(pt, c1[0], c1[-1])
+                    dd2 = perpendicular_distance(pt, c2[0], c2[-1])
+                    dists.append(dd1 + dd2)
+                thickness = np.mean(dists)
+            
+            thickness = round(thickness * 2) / 2.0
+            if is_horiz: orientation = 'horizontal'
+            elif is_vert: orientation = 'vertical'
+            else: orientation = 'diagonal'
+            
+            return {
+                'line': centerline, 'thickness': thickness,
+                'orientation': orientation, 'angle': angle
+            }
+        
+        # =====================================================================
+        # [변경] connect_collinear_endpoints:
+        #   1999↔1999 브릿지만 두께 유지, 나머지 교차점 브릿지는 thickness=0
+        # =====================================================================
+        def connect_collinear_endpoints(centerlines):
+            new_bridges = []
+            endpoints = []
+            for i, cl in enumerate(centerlines):
+                coords = list(cl['line'].coords)
+                if len(coords) < 2: continue
+                p_start, p_end = np.array(coords[0]), np.array(coords[-1])
+                v_start = p_start - np.array(coords[1]) if len(coords) > 1 else np.array([0, 0])
+                v_end = p_end - np.array(coords[-2]) if len(coords) > 1 else np.array([0, 0])
+                if np.linalg.norm(v_start) > 1e-6:
+                    endpoints.append({'pt': p_start, 'vec': v_start / np.linalg.norm(v_start),
+                                      'thickness': cl['thickness'], 'type': cl.get('type'), 'idx': i})
+                if np.linalg.norm(v_end) > 1e-6:
+                    endpoints.append({'pt': p_end, 'vec': v_end / np.linalg.norm(v_end),
+                                      'thickness': cl['thickness'], 'type': cl.get('type'), 'idx': i})
+            
+            open_endpoints = []
+            for i, ep1 in enumerate(endpoints):
+                is_open = True
+                for j, ep2 in enumerate(endpoints):
+                    if i == j: continue
+                    if np.linalg.norm(ep1['pt'] - ep2['pt']) < 10:
+                        is_open = False; break
+                if is_open: open_endpoints.append(ep1)
+            
+            matched = set()
+            for i, ep1 in enumerate(open_endpoints):
+                if i in matched: continue
+                best_match = None; best_dist = float('inf'); best_j = -1
+                for j, ep2 in enumerate(open_endpoints):
+                    if i == j or j in matched: continue
+                    gap = ep2['pt'] - ep1['pt']
+                    dist = np.linalg.norm(gap)
+                    limit = 500.0 if ep1['type'] == '1999' and ep2['type'] == '1999' else 100.0
+                    if 1 < dist <= limit:
+                        gap_dir = gap / dist
+                        dot1 = np.dot(ep1['vec'], gap_dir)
+                        dot2 = np.dot(ep2['vec'], -gap_dir)
+                        if dot1 > 0.9 and dot2 > 0.9:
+                            if dist < best_dist:
+                                best_dist = dist; best_match = ep2; best_j = j
+                
+                if best_match:
+                    mid_pt = (ep1['pt'] + best_match['pt']) / 2.0
+                    t1 = ep1.get('type')
+                    t2 = best_match.get('type')
+                    
+                    # [변경] 1999↔1999만 두께 유지, 나머지는 두께 생성 금지
+                    if t1 == '1999' and t2 == '1999':
+                        b_type = '1999'
+                        thk1, thk2 = ep1['thickness'], best_match['thickness']
+                    else:
+                        b_type = 'bridge'
+                        thk1, thk2 = 0.0, 0.0
+                    
+                    new_bridges.append({
+                        'line': LineString([tuple(ep1['pt']), tuple(mid_pt)]),
+                        'thickness': thk1, 'type': b_type
+                    })
+                    new_bridges.append({
+                        'line': LineString([tuple(mid_pt), tuple(best_match['pt'])]),
+                        'thickness': thk2, 'type': b_type
+                    })
+                    matched.add(i); matched.add(best_j)
+            
+            return centerlines + new_bridges, []
+        
+        def extend_to_nearby_lines(centerlines, max_dist=60.0):
+            new_centerlines = []
+            for i, cl in enumerate(centerlines):
+                coords = list(cl['line'].coords)
+                if len(coords) < 2:
+                    new_centerlines.append(cl); continue
+
+                p_start = np.array(coords[0])
+                v_start = p_start - np.array(coords[1])
+                L_start = np.linalg.norm(v_start)
+                if L_start > 1e-6:
+                    dir_start = v_start / L_start
+                    ray_line = LineString([tuple(p_start), tuple(p_start + dir_start * max_dist)])
+                    best_int_start = None; best_d_start = max_dist
+                    for j, other_cl in enumerate(centerlines):
+                        if i == j: continue
+                        inter = ray_line.intersection(other_cl['line'])
+                        if not inter.is_empty:
+                            if inter.geom_type == 'Point':
+                                d = np.linalg.norm(np.array([inter.x, inter.y]) - p_start)
+                                if 1e-3 < d <= best_d_start:
+                                    best_d_start = d; best_int_start = (inter.x, inter.y)
+                            elif inter.geom_type == 'MultiPoint':
+                                for pt in inter.geoms:
+                                    d = np.linalg.norm(np.array([pt.x, pt.y]) - p_start)
+                                    if 1e-3 < d <= best_d_start:
+                                        best_d_start = d; best_int_start = (pt.x, pt.y)
+                    if best_int_start: coords[0] = best_int_start
+
+                p_end = np.array(coords[-1])
+                v_end = p_end - np.array(coords[-2])
+                L_end = np.linalg.norm(v_end)
+                if L_end > 1e-6:
+                    dir_end = v_end / L_end
+                    ray_line = LineString([tuple(p_end), tuple(p_end + dir_end * max_dist)])
+                    best_int_end = None; best_d_end = max_dist
+                    for j, other_cl in enumerate(centerlines):
+                        if i == j: continue
+                        inter = ray_line.intersection(other_cl['line'])
+                        if not inter.is_empty:
+                            if inter.geom_type == 'Point':
+                                d = np.linalg.norm(np.array([inter.x, inter.y]) - p_end)
+                                if 1e-3 < d <= best_d_end:
+                                    best_d_end = d; best_int_end = (inter.x, inter.y)
+                            elif inter.geom_type == 'MultiPoint':
+                                for pt in inter.geoms:
+                                    d = np.linalg.norm(np.array([pt.x, pt.y]) - p_end)
+                                    if 1e-3 < d <= best_d_end:
+                                        best_d_end = d; best_int_end = (pt.x, pt.y)
+                    if best_int_end: coords[-1] = best_int_end
+                
+                new_centerlines.append({
+                    'line': LineString(coords), 'thickness': cl['thickness'],
+                    'type': cl.get('type', 'internal'),
+                    'orientation': cl.get('orientation', 'horizontal'),
+                    'angle': cl.get('angle', 0)
+                })
+            return new_centerlines
+
+        def split_all_lines_at_intersections(centerlines):
+            all_line_geoms = [cl['line'] for cl in centerlines]
+            intersection_points = []
+            for i in range(len(all_line_geoms)):
+                for j in range(i + 1, len(all_line_geoms)):
+                    try:
+                        inter = all_line_geoms[i].intersection(all_line_geoms[j])
+                        if inter.is_empty: continue
+                        if inter.geom_type == 'Point':
+                            intersection_points.append(inter)
+                        elif inter.geom_type == 'MultiPoint':
+                            intersection_points.extend(inter.geoms)
+                        elif inter.geom_type == 'GeometryCollection':
+                            for geom in inter.geoms:
+                                if geom.geom_type == 'Point':
+                                    intersection_points.append(geom)
+                    except: pass
+            for g in all_line_geoms:
+                intersection_points.append(Point(g.coords[0]))
+                intersection_points.append(Point(g.coords[-1]))
+            if not intersection_points:
+                return centerlines, []
+            unique_points = []
+            for pt in intersection_points:
+                if not unique_points or min(pt.distance(upt) for upt in unique_points) > 1e-3:
+                    unique_points.append(pt)
+            splitter = unary_union(unique_points)
+            new_centerlines = []
+            intersection_nodes = [(pt.x, pt.y) for pt in unique_points]
+            for cl in centerlines:
+                line = cl['line']
+                try:
+                    snapped_line = snap(line, splitter, 0.1)
+                    res = split(snapped_line, splitter)
+                    geoms = list(res.geoms) if hasattr(res, 'geoms') else [res]
+                    for geom in geoms:
+                        if geom.length > 0.1:
+                            new_centerlines.append({
+                                'line': geom, 'thickness': cl['thickness'],
+                                'type': cl.get('type', 'internal'),
+                                'orientation': cl.get('orientation', 'horizontal'),
+                                'angle': cl.get('angle', 0)
+                            })
+                except:
+                    new_centerlines.append(cl)
+            return new_centerlines, intersection_nodes
+
+        # =============================================================
+        # [추가] 평행 중복 1D선 필터링 (10mm 이내 → 짧은 쪽 제거)
+        # =============================================================
+        def filter_parallel_duplicates(centerlines, proximity_threshold=10.0):
+            if not centerlines: return centerlines, 0
+            n = len(centerlines)
+            remove_set = set()
+            cl_info = []
+            for idx, cl in enumerate(centerlines):
+                coords = list(cl['line'].coords)
+                p1, p2 = np.array(coords[0]), np.array(coords[-1])
+                v = p2 - p1
+                length = np.linalg.norm(v)
+                if length < 1e-6:
+                    cl_info.append(None); continue
+                angle = np.degrees(np.arctan2(v[1], v[0])) % 180
+                cl_info.append({'p1': p1, 'p2': p2, 'v': v, 'length': length,
+                                'angle': angle, 'unit': v / length})
+
+            for i in range(n):
+                if i in remove_set or cl_info[i] is None: continue
+                for j in range(i + 1, n):
+                    if j in remove_set or cl_info[j] is None: continue
+                    info_i, info_j = cl_info[i], cl_info[j]
+                    angle_diff = min(abs(info_i['angle'] - info_j['angle']),
+                                     180 - abs(info_i['angle'] - info_j['angle']))
+                    if angle_diff > 5: continue
+                    d1 = perpendicular_distance(info_j['p1'], info_i['p1'], info_i['p2'])
+                    d2 = perpendicular_distance(info_j['p2'], info_i['p1'], info_i['p2'])
+                    avg_dist = (d1 + d2) / 2.0
+                    if avg_dist > proximity_threshold: continue
+                    proj_s = np.dot(info_j['p1'] - info_i['p1'], info_i['unit'])
+                    proj_e = np.dot(info_j['p2'] - info_i['p1'], info_i['unit'])
+                    if proj_s > proj_e: proj_s, proj_e = proj_e, proj_s
+                    ov_start = max(0, proj_s)
+                    ov_end = min(info_i['length'], proj_e)
+                    if ov_end - ov_start < 1e-3: continue
+                    if info_i['length'] < info_j['length']:
+                        remove_set.add(i)
+                    else:
+                        remove_set.add(j)
+
+            removed_count = len(remove_set)
+            return [cl for idx, cl in enumerate(centerlines) if idx not in remove_set], removed_count
+
+        # =============================================================
+        # [추가] 교차점을 필터링된 선분에서만 재계산 (stale int_nodes 방지)
+        # =============================================================
+        def recompute_fresh_intersections(centerlines):
+            int_nodes = []
+            geoms = [cl['line'] for cl in centerlines]
+            for i in range(len(geoms)):
+                for j in range(i + 1, len(geoms)):
+                    try:
+                        inter = geoms[i].intersection(geoms[j])
+                        if inter.is_empty: continue
+                        if inter.geom_type == 'Point':
+                            int_nodes.append((inter.x, inter.y))
+                        elif inter.geom_type == 'MultiPoint':
+                            for pt in inter.geoms:
+                                int_nodes.append((pt.x, pt.y))
+                        elif inter.geom_type == 'GeometryCollection':
+                            for g in inter.geoms:
+                                if g.geom_type == 'Point':
+                                    int_nodes.append((g.x, g.y))
+                    except: pass
+            return int_nodes
+
+        # =============================================================
+        # [추가] 토폴로지 전체 재구축 (logical_nodes + edges + degree)
+        # =============================================================
+        def rebuild_topology_full(centerlines, int_nodes, radius=30.0):
+            raw_endpoints = []
+            for cl in centerlines:
+                coords = list(cl['line'].coords)
+                raw_endpoints.append(coords[0])
+                raw_endpoints.append(coords[-1])
+            raw_endpoints.extend(int_nodes)
+
+            logical_nodes = []
+            for pt in raw_endpoints:
+                pt_arr = np.array(pt)
+                found = False
+                for node in logical_nodes:
+                    if np.linalg.norm(pt_arr - np.array(node['coord'])) <= radius:
+                        node['raw_pts'].append(pt_arr)
+                        node['coord'] = np.mean(node['raw_pts'], axis=0)
+                        found = True; break
+                if not found:
+                    logical_nodes.append({'id': len(logical_nodes), 'coord': pt_arr, 'raw_pts': [pt_arr]})
+
+            topo_edges = []
+            for cl in centerlines:
+                coords = list(cl['line'].coords)
+                p1, p2 = np.array(coords[0]), np.array(coords[-1])
+                n1_id, n2_id = -1, -1
+                for n in logical_nodes:
+                    if np.linalg.norm(p1 - n['coord']) <= radius: n1_id = n['id']
+                    if np.linalg.norm(p2 - n['coord']) <= radius: n2_id = n['id']
+                topo_edges.append({
+                    'start_node': n1_id, 'end_node': n2_id,
+                    'line_geom': cl['line'], 'thickness': cl['thickness'],
+                    'type': cl.get('type', 'internal')
+                })
+
+            node_degree = {n['id']: 0 for n in logical_nodes}
+            for edge in topo_edges:
+                if edge['start_node'] >= 0:
+                    node_degree[edge['start_node']] += 1
+                if edge['end_node'] >= 0:
+                    node_degree[edge['end_node']] += 1
+
+            return {'logical_nodes': logical_nodes, 'topo_edges': topo_edges,
+                    'node_degree': node_degree}
+
+        # =============================================================
+        # [추가] 고아/댕글링 노드 및 연결 엣지 필터링
+        #   - degree=0: 완전 고아 → 노드 제거
+        #   - degree=1 + single(미합병): 댕글링 → 노드+엣지 제거
+        #   반복 적용하여 cascade 처리
+        # =============================================================
+        def filter_dangling_elements(centerlines, topo_data):
+            logical_nodes = topo_data['logical_nodes']
+            topo_edges = topo_data['topo_edges']
+            node_degree = topo_data['node_degree']
+
+            dangling_ids = set()
+            for n in logical_nodes:
+                deg = node_degree.get(n['id'], 0)
+                is_single = len(n['raw_pts']) <= 1
+                if deg == 0:
+                    dangling_ids.add(n['id'])
+                elif deg == 1 and is_single:
+                    dangling_ids.add(n['id'])
+
+            if not dangling_ids:
+                return centerlines, 0
+
+            keep_indices = []
+            for idx, edge in enumerate(topo_edges):
+                if edge['start_node'] in dangling_ids or edge['end_node'] in dangling_ids:
+                    continue
+                keep_indices.append(idx)
+
+            filtered = [centerlines[idx] for idx in keep_indices]
+            removed = len(centerlines) - len(filtered)
+            return filtered, removed
+
+        try:
+            temp_left, temp_right, input_thks = [], [], []
+            for i, l_seg in enumerate(self.left_1999_segments):
+                if progress.wasCanceled(): return
+                if i % 2 == 0: QApplication.processEvents()
+                try: t = float(self.shell_thickness_inputs[i].text())
+                except: t = 10.0
+                input_thks.append(t)
+                lp = self.generate_outward_thickness(l_seg, t)
+                temp_left.append(lp)
+                temp_right.append(affinity.scale(lp, xfact=-1.0, origin=(0, 0)))
+
+            QApplication.processEvents()
+
+            all_shells = temp_left + temp_right
+            if all_shells:
+                combined_shell = unary_union(all_shells)
+                thickness_y_min = combined_shell.bounds[1]
+                temp_left = [affinity.translate(p, yoff=-thickness_y_min) for p in temp_left]
+                temp_right = [affinity.translate(p, yoff=-thickness_y_min) for p in temp_right]
+                calc_1102_raw = [affinity.translate(l, yoff=-thickness_y_min) for l in self.lines_1102_raw]
+                calc_157 = [affinity.translate(l, yoff=-thickness_y_min) for l in self.lines_157]
+                calc_6001 = [affinity.translate(l, yoff=-thickness_y_min) for l in self.lines_6001]
+                calc_7001 = [affinity.translate(l, yoff=-thickness_y_min) for l in self.lines_7001]
+                calc_9001 = [affinity.translate(l, yoff=-thickness_y_min) for l in self.lines_9001]
+                calc_1999_raw = [affinity.translate(l, yoff=-thickness_y_min) for l in self.raw_1999_lines]
+                left_1999_segments_shifted = [affinity.translate(l, yoff=-thickness_y_min) for l in self.left_1999_segments]
+                calc_minus1204_raw = [affinity.translate(l, yoff=-thickness_y_min) for l in self.lines_minus1204]
+            else:
+                calc_1102_raw, calc_157 = self.lines_1102_raw, self.lines_157
+                calc_6001, calc_7001, calc_9001 = self.lines_6001, self.lines_7001, self.lines_9001
+                calc_1999_raw = self.raw_1999_lines
+                left_1999_segments_shifted = self.left_1999_segments
+                calc_minus1204_raw = self.lines_minus1204
+
+            lines_1102_healed = self.heal_1102_collinear(calc_1102_raw, threshold_gap=150.0)
+            lines_157_healed = self.heal_157_segments(calc_157, calc_1999_raw, threshold_gap=150.0)
+            
+            ext, perp = float(self.txt_ext.text()), float(self.txt_perp.text())
+            all_internal_lines = lines_1102_healed + lines_157_healed + calc_6001 + calc_7001 + calc_9001
+            internal_polys = self.apply_original_algorithm(all_internal_lines, calc_1999_raw, ext, perp, 0.5 * 1e6) if all_internal_lines else []
+
+            full_list = temp_left + temp_right + internal_polys
+            if not full_list: return
+
+            self.calculated_polygons = full_list
+            self.calc_total_area = sum(p.area for p in self.calculated_polygons)
+            self.calc_na_bl = sum(p.centroid.y * p.area for p in self.calculated_polygons) / (
+                self.calc_total_area if self.calc_total_area != 0 else 1e-9)
+
+            self.calc_ixx = 0.0
+
+            def ring_ixx_na(ring, na_y):
+                pts = list(ring.coords)
+                val = 0.0
+                for i in range(len(pts) - 1):
+                    x1, y1 = pts[i][0], pts[i][1] - na_y
+                    x2, y2 = pts[i + 1][0], pts[i + 1][1] - na_y
+                    val += (y1 ** 2 + y1 * y2 + y2 ** 2) * (x1 * y2 - x2 * y1)
+                return abs(val / 12.0)
+
+            for idx, poly in enumerate(self.calculated_polygons):
+                if progress.wasCanceled(): return
+                if idx % 10 == 0: QApplication.processEvents()
+                self.calc_ixx += ring_ixx_na(poly.exterior, self.calc_na_bl)
+                for h in poly.interiors: self.calc_ixx -= ring_ixx_na(h, self.calc_na_bl)
+
+            self.raw_swbm = float(self.txt_swbm.text())
+            self.raw_shear = float(self.txt_shear_v.text())
+
+            # ===== 1D 추출 파이프라인 =====
+            progress.setLabelText("Step 1: Filtering noise (30mm)...")
+            filtered_157 = filter_short_segments(calc_157, min_length=30)
+            filtered_1102 = filter_short_segments(calc_1102_raw, min_length=30)
+            split_157 = []
+            for l in filtered_157:
+                split_157.extend([s for s in split_line_by_angle(l, 1.0) if s.length > 30.0])
+            split_1102 = []
+            for l in filtered_1102:
+                split_1102.extend([s for s in split_line_by_angle(l, 1.0) if s.length > 30.0])
+                
+            progress.setLabelText("Step 2: Healing 1102...")
+            healed_1102 = self.heal_1102_collinear(split_1102, threshold_gap=150)
+            
+            progress.setLabelText("Step 3: Processing 1999 layer...")
+            lines_1999_final = []
+            for i, l_seg in enumerate(left_1999_segments_shifted):
+                try: t_act = float(self.shell_thickness_inputs[i].text())
+                except: t_act = 10.0
+                if l_seg.length <= 30.0: continue 
+                lines_1999_final.append({'line': l_seg, 'thickness': t_act, 'type': '1999'})
+                r_line = affinity.scale(l_seg, xfact=-1.0, origin=(0, 0))
+                lines_1999_final.append({'line': r_line, 'thickness': t_act, 'type': '1999'})
+            
+            progress.setLabelText("Step 4: Matching pairs...")
+            pairs_157 = match_parallel_pairs_robust(split_157, max_distance=100)
+            pairs_1102 = match_parallel_pairs_robust(healed_1102, max_distance=100)
+            
+            progress.setLabelText("Step 5: Generating centerlines...")
+            centerlines_157 = [generate_centerline_from_pair(p[0], p[1], p[2]) for p in pairs_157]
+            centerlines_1102 = [generate_centerline_from_pair(p[0], p[1], p[2]) for p in pairs_1102]
+            for cl in centerlines_157: cl['type'] = '157'
+            for cl in centerlines_1102: cl['type'] = '1102'
+            all_centerlines = lines_1999_final + centerlines_157 + centerlines_1102
+            
+            progress.setLabelText("Step 6: Collinear connections (bridge thk=0)...")
+            all_centerlines, _ = connect_collinear_endpoints(all_centerlines)
+
+            progress.setLabelText("Step 7: Ray-casting extension (60mm)...")
+            all_centerlines = extend_to_nearby_lines(all_centerlines, max_dist=60.0)
+            
+            progress.setLabelText("Step 8: Split at intersections...")
+            all_centerlines, _ = split_all_lines_at_intersections(all_centerlines)
+
+            # =============================================================
+            # Step 10: 평행 중복 제거 (≤10mm → 짧은 쪽 삭제)
+            # =============================================================
+            progress.setLabelText("Step 10: Remove parallel duplicates (≤10mm)...")
+            count_before = len(all_centerlines)
+            all_centerlines, dup_removed = filter_parallel_duplicates(all_centerlines, 10.0)
+
+            # =============================================================
+            # Step 10b: 삭제 후 교차점을 나머지 선분에서만 재계산
+            #   → stale int_nodes 문제 해결 → 노드 위치 왜곡 방지
+            # =============================================================
+            progress.setLabelText("Step 10b: Recomputing intersections (fresh)...")
+            fresh_int_nodes = recompute_fresh_intersections(all_centerlines)
+
+            # =============================================================
+            # Step 11: 1차 토폴로지 구축
+            # =============================================================
+            progress.setLabelText("Step 11: Building topology...")
+            topo_data = rebuild_topology_full(all_centerlines, fresh_int_nodes, radius=30.0)
+
+            # =============================================================
+            # Step 12: 고아/댕글링 노드 + 엣지 필터링 (반복)
+            #   삭제된 선분에 의해 merge되었던 노드가 원위치로 복원되고,
+            #   합병되지 못한 단독 노드(degree≤1)도 제거
+            # =============================================================
+            progress.setLabelText("Step 12: Filtering orphan nodes (iterative)...")
+            total_orphan_removed = 0
+            for _pass in range(5):  # 최대 5회 반복 (cascade)
+                all_centerlines, orphan_removed = filter_dangling_elements(
+                    all_centerlines, topo_data)
+                total_orphan_removed += orphan_removed
+                if orphan_removed == 0:
+                    break
+                # 재계산
+                fresh_int_nodes = recompute_fresh_intersections(all_centerlines)
+                topo_data = rebuild_topology_full(all_centerlines, fresh_int_nodes, radius=30.0)
+
+            # =============================================================
+            # Step 13: 최종 토폴로지 확정
+            # =============================================================
+            progress.setLabelText("Step 13: Final topology rebuild...")
+            fresh_int_nodes = recompute_fresh_intersections(all_centerlines)
+            topo_final = rebuild_topology_full(all_centerlines, fresh_int_nodes, radius=30.0)
+
+            self.topological_nodes = [n['coord'] for n in topo_final['logical_nodes']]
+            self.nodes = [tuple(c) for c in self.topological_nodes]
+            self.single_nodes = [tuple(n['coord']) for n in topo_final['logical_nodes']
+                                 if len(n['raw_pts']) == 1]
+            self.merged_nodes = [tuple(n['coord']) for n in topo_final['logical_nodes']
+                                 if len(n['raw_pts']) > 1]
+            self.topological_edges = topo_final['topo_edges']
+            self.centerlines = all_centerlines
+            
+            # ===== 보고서 생성 =====
+            all_y = [pt[1] for p in self.calculated_polygons for pt in p.exterior.coords]
+            y_max, y_min = max(all_y), min(all_y)
+            self.calc_depth = (y_max - y_min) * 1e-3
+            dist_top, dist_btm = y_max - self.calc_na_bl, self.calc_na_bl - y_min
+            z_act_top_mm3 = self.calc_ixx / dist_top if dist_top != 0 else 1e-9
+            self.calc_z_top, self.calc_z_btm = z_act_top_mm3 * 1e-9, (
+                        self.calc_ixx / dist_btm * 1e-9) if dist_btm != 0 else 0
+            self.act_fb = (abs(self.raw_swbm) * 9.80665 * 1e6) / z_act_top_mm3
+
+            # degree 통계
+            degree_dist = {}
+            for nid, deg in topo_final['node_degree'].items():
+                degree_dist[deg] = degree_dist.get(deg, 0) + 1
+            deg_str = ", ".join([f"deg{k}={v}" for k, v in sorted(degree_dist.items())])
+
+            res = f"--- Applied Loads ---\n"
+            res += f"S.W.B.M          : {self.raw_swbm:,.2f} tm\n"
+            res += f"Shear Force      : {self.raw_shear:,.2f} t\n\n"
+            res += f"--- Geometric Properties ---\n"
+            res += f"Total Area       : {self.calc_total_area / 100.0:>10,.2f} cm^2\n"
+            res += f"Inertia          : {self.calc_ixx * 1e-12:,.6e} m^4\n"
+            res += f"Depth            : {self.calc_depth:.3f} m\n"
+            res += f"Distance of N.A  : {self.calc_na_bl * 1e-3:.3f} m from B.L\n"
+            res += f"Zact_btm         : {self.calc_z_btm:,.4f} m^3\n"
+            res += f"Zact_top         : {self.calc_z_top:,.4f} m^3\n\n"
+            res += f"--- 1D Extraction Results ---\n"
+            res += f"Centerlines      : {len(self.centerlines)}\n"
+            res += f"Logical Nodes    : {len(self.nodes)}\n"
+            res += f"  Single/Merged  : {len(self.single_nodes)} / {len(self.merged_nodes)}\n"
+            res += f"  Degree dist.   : {deg_str}\n"
+            res += f"Parallel dup.    : {dup_removed} removed (≤10mm)\n"
+            res += f"Orphan cleanup   : {total_orphan_removed} edges removed\n"
+            
+            self.base_report = res
+            self.result_box.setText(self.base_report)
+            self.is_calculated = True
+            self.btn_eval.setEnabled(True)
+            
+            progress.setLabelText("Rendering UI...")
+            progress.setMaximum(0)
+            QApplication.processEvents()
+            self.refresh_ui()
+
+        except Exception as e:
+            self.result_box.setText(f"Error: {e}\n{traceback.format_exc()}")
+        finally:
+            progress.close()
+
+    def evaluate_strength(self):
+        if not self.is_calculated: return
+        try: k = float(self.txt_grade_k.text())
+        except: k = 1.0
+        h_t = self.combo_hull.currentText()
+        if self.combo_section.currentText() == "continuous section":
+            self.allow_fb = 143 / k
+        else:
+            self.allow_fb = {"mild": 60, "H.T": 75, "H.T with BKT": 112}.get(h_t, 60)
+
+        final_res = self.base_report + "\n--- Strength Check & Utilization ---\n"
+        final_res += f"Material         : {self.combo_hull.currentText()}\n\n"
+        final_res += f"Bending Stress   : {self.act_fb:.2f} / {self.allow_fb:.2f} N/mm2 "
+        final_res += f"({self.act_fb / self.allow_fb * 100:.1f}%) "
+        final_res += f"[{'PASS' if self.act_fb <= self.allow_fb else 'FAIL'}]\n"
+        self.result_box.setText(final_res)
+        self.btn_save_frame.setEnabled(True)
+
+    def save_current_frame(self):
+        frame_name, ok = QInputDialog.getText(self, "Save Frame", "Enter Frame Name:",
+                                              QLineEdit.EchoMode.Normal, "FR.")
+        if not ok or not frame_name.strip(): return
+        img_sec, img_shr = io.BytesIO(), io.BytesIO()
+        self.fig1.savefig(img_sec, format='png', bbox_inches='tight', dpi=150)
+        self.fig2.savefig(img_shr, format='png', bbox_inches='tight', dpi=150)
+        data = {
+            "Frame": frame_name.strip(), "SWBM": self.raw_swbm, "Depth": round(self.calc_depth, 2),
+            "NA": round(self.calc_na_bl * 1e-3, 2), "Ixx": round(self.calc_ixx * 1e-12, 2),
+            "Grade_K": float(self.txt_grade_k.text()), "Z_btm": round(self.calc_z_btm, 2),
+            "Z_top": round(self.calc_z_top, 2),
+            "Act_FB": round(self.act_fb, 1), "Allow_FB": round(self.allow_fb, 1), "Shear": 0.0,
+            "Pos_Shear": 'N/A', "Thk": 0.0, "Unit_q": 0.0, "Act_FS": 0.0,
+            "Allow_FS": 0.0, "ImgSec": img_sec.getvalue(), "ImgShr": img_shr.getvalue()
+        }
+        self.saved_frames_data.append(data)
+        self.update_history_list_ui()
+
+    def update_history_list_ui(self):
+        for i in reversed(range(self.history_list_layout.count())):
+            w = self.history_list_layout.itemAt(i).widget()
+            if w: w.deleteLater()
+        for i, data in enumerate(self.saved_frames_data):
+            f = QFrame()
+            f.setStyleSheet("background: white; border: 1px solid #BDC3C7; border-radius: 4px; margin-bottom: 2px;")
+            l = QHBoxLayout(f)
+            l.setContentsMargins(5, 5, 5, 5)
+            lbl_name = QLabel(f"📝 {data['Frame']}")
+            lbl_name.setStyleSheet("font-weight:bold; border:none;")
+            l.addWidget(lbl_name)
+            l.addStretch()
+            for btn_text, handler, enable in [
+                ("✏️", lambda chk=False, idx=i: self.rename_frame(idx), True),
+                ("⬆️", lambda chk=False, idx=i: self.move_frame_up(idx), i > 0),
+                ("⬇️", lambda chk=False, idx=i: self.move_frame_down(idx), i < len(self.saved_frames_data) - 1),
+                ("❌", lambda chk=False, idx=i: self.delete_saved_frame(idx), True)]:
+                btn = QPushButton(btn_text)
+                btn.setFixedSize(24, 24)
+                btn.setStyleSheet("border: none; background: transparent;")
+                btn.setEnabled(enable)
+                btn.clicked.connect(handler)
+                l.addWidget(btn)
+            self.history_list_layout.addWidget(f)
+
+    def rename_frame(self, idx):
+        n, ok = QInputDialog.getText(self, "Rename", "Frame Name:", QLineEdit.Normal,
+                                     self.saved_frames_data[idx]['Frame'])
+        if ok and n.strip(): self.saved_frames_data[idx]['Frame'] = n.strip(); self.update_history_list_ui()
+
+    def move_frame_up(self, index):
+        if index > 0:
+            self.saved_frames_data.insert(index - 1, self.saved_frames_data.pop(index))
+            self.update_history_list_ui()
+
+    def move_frame_down(self, index):
+        if index < len(self.saved_frames_data) - 1:
+            self.saved_frames_data.insert(index + 1, self.saved_frames_data.pop(index))
+            self.update_history_list_ui()
+
+    def delete_saved_frame(self, index):
+        if 0 <= index < len(self.saved_frames_data):
+            del self.saved_frames_data[index]; self.update_history_list_ui()
+
+    def apply_outer_border(self, ws, min_r, max_r, min_c, max_c):
+        from openpyxl.styles import Border, Side
+        thick = Side(border_style="medium", color="000000")
+        for r in range(min_r, max_r + 1):
+            for c in range(min_c, max_c + 1):
+                cell = ws.cell(row=r, column=c)
+                b = cell.border
+                cell.border = Border(top=thick if r == min_r else b.top,
+                                     bottom=thick if r == max_r else b.bottom,
+                                     left=thick if c == min_c else b.left,
+                                     right=thick if c == max_c else b.right)
+
+    def export_to_excel(self):
+        if not self.saved_frames_data: return
+        path, _ = QFileDialog.getSaveFileName(self, "Export to Excel", "Section_Analysis_Report.xlsx",
+                                              "Excel Files (*.xlsx)")
+        if not path: return
+        try:
+            from openpyxl import Workbook
+            from openpyxl.styles import Alignment, Font, PatternFill, Border, Side
+            from openpyxl.utils import get_column_letter
+            from openpyxl.drawing.image import Image as XlImage
+            from openpyxl.worksheet.pagebreak import Break
+
+            wb = Workbook()
+            ws = wb.active
+            ws.title = "Strength Result"
+            f_title = Font(name='돋움', size=14, bold=True, underline='double')
+            f_11b = Font(name='돋움', size=11, bold=True)
+            f_11n = Font(name='돋움', size=11)
+            f_10n = Font(name='돋움', size=10)
+            f_18b = Font(name='돋움', size=18, bold=True)
+            a_c = Alignment(horizontal='center', vertical='center', wrap_text=True)
+            fill_y = PatternFill(start_color='FFF2CC', end_color='FFF2CC', fill_type='solid')
+            fill_g = PatternFill(start_color='E2EFDA', end_color='E2EFDA', fill_type='solid')
+            b_all = Border(top=Side(border_style="thin", color="000000"),
+                           left=Side(border_style="thin", color="000000"),
+                           right=Side(border_style="thin", color="000000"),
+                           bottom=Side(border_style="thin", color="000000"))
+
+            ws.merge_cells('A1:I4')
+            ws.cell(1, 1, "H0000 Conclusion of Scantling Check for Partial Floating Condition").font = f_title
+            ws.cell(1, 1).alignment = a_c
+            ws.merge_cells('J1:J4')
+            ws.cell(1, 10, "검 토").alignment = a_c
+            ws.cell(1, 11, "PART장").alignment = a_c
+            ws.cell(1, 12, "보임과장").alignment = a_c
+            ws.merge_cells('K2:K3'); ws.merge_cells('L2:L3')
+            ws.row_dimensions[2].height = ws.row_dimensions[3].height = 30
+            today = datetime.datetime.now().strftime("%Y.%m.%d.")
+            ws.cell(4, 11, today).alignment = a_c
+            ws.cell(4, 12, today).alignment = a_c
+            for r in range(1, 5):
+                for c in range(1, 13): ws.cell(r, c).border = b_all
+
+            ws.cell(5, 1, "*Allowable stress").font = f_11b
+            ws.merge_cells('A6:A8'); ws.cell(6, 1, "Bending Stress")
+            ws.merge_cells('B6:C6'); ws.cell(6, 2, "Continuous Section")
+            ws.merge_cells('D6:L6'); ws.cell(6, 4, "143/k for bending stress")
+            ws.merge_cells('B7:C8'); ws.cell(7, 2, "Discontinuous Section")
+            ws.merge_cells('D7:F7'); ws.cell(7, 4, "60 N/mm² for S/H (Mild)")
+            ws.merge_cells('G7:I7'); ws.cell(7, 7, "75 N/mm² for S/H (H.T)")
+            ws.merge_cells('J7:L7'); ws.cell(7, 10, "112 N/mm² for S/H (H.T with BKT)")
+            ws.merge_cells('D8:F8'); ws.cell(8, 4, "112 N/mm² for D/H (Mild)")
+            ws.merge_cells('G8:I8'); ws.cell(8, 7, "150 N/mm² for D/H (H.T)")
+            ws.merge_cells('J8:L8'); ws.cell(8, 10, "157 N/mm² for D/H (H.T with BKT)")
+            for r in range(6, 9):
+                for c in range(1, 13):
+                    ws.cell(r, c).border = b_all; ws.cell(r, c).alignment = a_c
+
+            row_idx = 10
+            for data in self.saved_frames_data:
+                headers = ["Position", "S.W.B.M\n( t·m )", "Depth(m)", "Position of\nN.A from B.L(m)",
+                           "I_xx(m^4)", "Grade (k)", "Zact_at btm\n(m³)", "Zact_at top\n(m³)",
+                           "Bending stress_at top\n(N/mm²)", "Allowable stress\n(N/mm²)",
+                           "Percentage\n(%)", "Result"]
+                for i, h in enumerate(headers, 1):
+                    cell = ws.cell(row_idx, i, h)
+                    cell.alignment = a_c; cell.font = f_10n; cell.border = b_all
+
+                r2 = [data['Frame'], data['SWBM'], data['Depth'], data['NA'], data['Ixx'],
+                      data['Grade_K'], data['Z_btm'], data['Z_top'], data['Act_FB'], data['Allow_FB'],
+                      data['Act_FB'] / data['Allow_FB'] if data['Allow_FB'] > 0 else 0,
+                      "OK" if data['Act_FB'] <= data['Allow_FB'] else "NG"]
+                for i, v in enumerate(r2, 1):
+                    cell = ws.cell(row_idx + 1, i, v)
+                    cell.alignment = a_c; cell.border = b_all; cell.font = f_11n
+                    if i in [2, 3, 4, 5, 6]: cell.fill = fill_y
+                    if i in [9, 10, 11]: cell.fill = fill_g
+                    if i == 2: cell.number_format = '#,##0'
+                    elif i == 6: cell.number_format = '0.00'
+                    elif i == 11: cell.number_format = '0%'
+                    elif i in [3, 4, 5, 7, 8]: cell.number_format = '#,##0.00'
+                row_idx += 3
+
+            self.apply_outer_border(ws, 1, row_idx - 1, 1, 12)
+            for i, w in enumerate([14, 13, 10, 16, 13, 10, 12, 12, 18, 16, 12, 12], 1):
+                ws.column_dimensions[get_column_letter(i)].width = w
+            ws.page_setup.orientation = ws.ORIENTATION_PORTRAIT
+            ws.page_setup.fitToPage = True; ws.page_setup.fitToWidth = 1; ws.page_setup.fitToHeight = 0
+            ws.sheet_view.view = 'pageBreakPreview'
+            ws.print_area = f"A1:L{row_idx - 1}"
+            ws.page_setup.paperSize = ws.PAPERSIZE_A4
+            ws.page_margins.left = 0.3; ws.page_margins.right = 0.3
+            ws.print_options.horizontalCentered = True
+
+            ws_v = wb.create_sheet(title="Visualizations")
+            ws_v.sheet_view.view = 'pageBreakPreview'
+            ws_v.page_setup.orientation = ws_v.ORIENTATION_LANDSCAPE
+            ws_v.page_setup.fitToPage = True; ws_v.page_setup.fitToWidth = 0; ws_v.page_setup.fitToHeight = 1
+            col_pos = 2
+            for d in self.saved_frames_data:
+                ws_v.cell(2, col_pos, f"Results: {d['Frame']}").font = f_18b
+                im1 = XlImage(io.BytesIO(d['ImgSec']))
+                im1.width, im1.height = int(im1.width * 0.5), int(im1.height * 0.5)
+                ws_v.add_image(im1, ws_v.cell(4, col_pos).coordinate)
+                im2 = XlImage(io.BytesIO(d['ImgShr']))
+                im2.width, im2.height = int(im2.width * 0.5), int(im2.height * 0.5)
+                ws_v.add_image(im2, ws_v.cell(22, col_pos).coordinate)
+                ws_v.col_breaks.append(Break(id=((col_pos - 2) // 8 + 1) * 8))
+                col_pos += 8
+            ws_v.print_area = f"A1:{get_column_letter(col_pos - 1)}40"
+            for i in range(1, col_pos):
+                ws_v.column_dimensions[get_column_letter(i)].width = 9
+
+            wb.save(path)
+            QMessageBox.information(self, "Success", "Export Done!")
+        except Exception as e:
+            QMessageBox.critical(self, "Error", str(e))
+
+    def refresh_ui(self):
+        saved = [edit.text() for edit in self.shell_thickness_inputs]
+        self.fig1.clear(); self.fig2.clear()
+        ax1, ax2 = self.fig1.add_subplot(111), self.fig2.add_subplot(111)
+
+        for i in reversed(range(self.thickness_layout.count())):
+            w = self.thickness_layout.itemAt(i).widget()
+            if w: w.setParent(None)
+        self.shell_thickness_inputs.clear()
+
+        if self.is_calculated:
+            for i, poly in enumerate(self.calculated_polygons):
+                ax1.fill(*poly.exterior.xy, color='blue', alpha=0.4)
+                ax1.plot(*poly.exterior.xy, color='darkblue', lw=1)
+
+            if hasattr(self, 'centerlines') and self.centerlines:
+                for cl in self.centerlines:
+                    line_obj = cl['line']
+                    x, y = line_obj.xy
+                    cl_type = cl.get('type', '')
+                    if cl_type == '1999': color = '#FF00FF'
+                    elif cl_type == '157': color = '#00FFFF'
+                    elif cl_type == '1102': color = '#FFA500'
+                    elif cl_type == 'bridge': color = '#AAAAAA'
+                    else: color = '#00FF00'
+                    
+                    thk = cl.get('thickness', 10.0)
+                    if thk > 0:
+                        try:
+                            poly = line_obj.buffer(thk / 2.0, cap_style=2)
+                            if poly.geom_type == 'Polygon':
+                                ax2.fill(*poly.exterior.xy, color=color, alpha=0.3, zorder=9, edgecolor='none')
+                            elif poly.geom_type == 'MultiPolygon':
+                                for p in poly.geoms:
+                                    ax2.fill(*p.exterior.xy, color=color, alpha=0.3, zorder=9, edgecolor='none')
+                        except: pass
+                    
+                    lw = 2.5 if thk > 0 else 1.0
+                    ls = '-' if thk > 0 else '--'
+                    ax2.plot(x, y, color=color, linewidth=lw, alpha=0.9, zorder=10, linestyle=ls)
+
+            if hasattr(self, 'single_nodes') and self.single_nodes:
+                nx = [pt[0] for pt in self.single_nodes]
+                ny = [pt[1] for pt in self.single_nodes]
+                ax2.plot(nx, ny, 'ro', markersize=4, markeredgecolor='white',
+                        markeredgewidth=1, label=f'Single ({len(self.single_nodes)})', zorder=11)
+
+            if hasattr(self, 'merged_nodes') and self.merged_nodes:
+                mx = [pt[0] for pt in self.merged_nodes]
+                my = [pt[1] for pt in self.merged_nodes]
+                ax2.plot(mx, my, 'cD', markersize=7, markeredgecolor='black',
+                        markeredgewidth=1, label=f'Merged ({len(self.merged_nodes)})', zorder=12)
+            
+            if not (hasattr(self, 'single_nodes') and self.single_nodes) and \
+               hasattr(self, 'nodes') and self.nodes:
+                nx = [pt[0] for pt in self.nodes]
+                ny = [pt[1] for pt in self.nodes]
+                ax2.plot(nx, ny, 'ro', markersize=5, markeredgecolor='white',
+                        markeredgewidth=1, label=f'Nodes ({len(self.nodes)})', zorder=11)
+            
+            ax2.legend(loc="upper right", fontsize=8)
+        else:
+            if self.raw_1999_lines:
+                for ls in self.raw_1999_lines: ax1.plot(*ls.xy, color='black', lw=1.5)
+            for i, l in enumerate(self.left_1999_segments):
+                ax1.text(l.centroid.x, l.centroid.y, f"S{i + 1}", fontsize=10, fontweight='bold',
+                         ha='center', va='center',
+                         bbox=dict(facecolor='white', alpha=0.7, edgecolor='none'))
+
+        for i in range(len(self.left_1999_segments)):
+            f = QFrame()
+            r = QHBoxLayout(f)
+            f.setStyleSheet("border-left: 4px solid #2E86C1; background: #FDFEFE; margin-bottom: 2px;")
+            r.addWidget(QLabel(f"S{i + 1}:"))
+            r.addStretch()
+            edit = QLineEdit(saved[i] if i < len(saved) else "10")
+            edit.setFixedWidth(self.field_width)
+            edit.setStyleSheet(self.input_style)
+            r.addWidget(edit)
+            self.thickness_layout.addWidget(f)
+            self.shell_thickness_inputs.append(edit)
+
+        for ax in [ax1, ax2]:
+            ax.set_aspect('equal')
+            ax.grid(True, lw=0.3, alpha=0.5)
+            ax.xaxis.set_major_formatter(FuncFormatter(lambda x, pos: f"{-x:g}"))
+        self.can1.draw()
+        self.can2.draw()
+
+if __name__ == "__main__":
+    app = QApplication(sys.argv)
+    win = UltimateShipAnalyzer()
+    win.show()
+    sys.exit(app.exec())
