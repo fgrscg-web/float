@@ -33,7 +33,7 @@ rcParams['font.family'] = 'Malgun Gothic'
 rcParams['axes.unicode_minus'] = False
 
 # =========================================================================
-# [추가] 육안으로 짝지어진 선분을 확인하기 위한 전용 팝업 다이얼로그
+# [디버깅] 짝지어진 선분을 확인하기 위한 전용 팝업
 # =========================================================================
 class PairViewerDialog(QDialog):
     def __init__(self, orig_157, pairs_157, orig_1102, pairs_1102, parent=None):
@@ -64,29 +64,26 @@ class PairViewerDialog(QDialog):
         ax.set_aspect('equal')
         ax.grid(True, linestyle=':', alpha=0.6)
 
-        # 원본 선분 그리기 (버려지는 부분 확인용)
-        for l in orig_157:
-            ax.plot(*l.xy, color='gray', linewidth=1.5, alpha=0.3)
-        for l in orig_1102:
-            ax.plot(*l.xy, color='gray', linewidth=1.5, alpha=0.3)
+        for l in orig_157: ax.plot(*l.xy, color='gray', linewidth=1.5, alpha=0.3)
+        for l in orig_1102: ax.plot(*l.xy, color='gray', linewidth=1.5, alpha=0.3)
 
-        # 157 레이어 쌍 그리기
-        for p1, p2, dist in pairs_157:
-            ax.plot(*p1.xy, color='#00FFFF', linewidth=3, alpha=0.8) # Cyan
-            ax.plot(*p2.xy, color='#0000FF', linewidth=3, alpha=0.8) # Blue
-            # 매칭된 두 선의 시작점을 빨간 점선으로 연결
+        # 157 레이어 그리기
+        for p in pairs_157:
+            p1, p2 = p['line1'], p['line2']
+            ax.plot(*p1.xy, color='#00FFFF', linewidth=3, alpha=0.8)
+            ax.plot(*p2.xy, color='#0000FF', linewidth=3, alpha=0.8)
             ax.plot([p1.coords[0][0], p2.coords[0][0]], 
                     [p1.coords[0][1], p2.coords[0][1]], color='red', linestyle='--', linewidth=1)
 
-        # 1102 레이어 쌍 그리기
-        for p1, p2, dist in pairs_1102:
-            ax.plot(*p1.xy, color='#FFA500', linewidth=3, alpha=0.8) # Orange
-            ax.plot(*p2.xy, color='#FF0000', linewidth=3, alpha=0.8) # Red
+        # 1102 레이어 그리기 (에러 수정된 부분: 딕셔너리 형태로 호출)
+        for p in pairs_1102:
+            p1, p2 = p['line1'], p['line2']
+            ax.plot(*p1.xy, color='#FFA500', linewidth=3, alpha=0.8)
+            ax.plot(*p2.xy, color='#FF0000', linewidth=3, alpha=0.8)
             ax.plot([p1.coords[0][0], p2.coords[0][0]], 
                     [p1.coords[0][1], p2.coords[0][1]], color='red', linestyle='--', linewidth=1)
 
         canvas.draw()
-
 
 class UltimateShipAnalyzer(QMainWindow):
     def __init__(self):
@@ -563,104 +560,199 @@ class UltimateShipAnalyzer(QMainWindow):
                 segments.append(LineString(current_segment))
             return segments
 
-        def perpendicular_distance(point, line_start, line_end):
-            p = np.array(point)
-            a = np.array(line_start)
-            b = np.array(line_end)
-            ab = b - a
+        # =====================================================================
+        # [신규] 157 레이어용 거시적 컷팅: 계단은 무시하고 전체 기울기 변화에서만 컷팅
+        # =====================================================================
+        def split_macroscopic_bends(line, tolerance=50.0):
+            # simplify를 통해 잔잔한 계단(stair-steps) 형상을 일직선으로 펴줌
+            simp = line.simplify(tolerance)
+            # 펴주고 났는데도 점이 3개 이상이라는 건 전체적인 기울기가 크게 꺾였다는 의미
+            if len(simp.coords) > 2:
+                split_lines = []
+                coords = list(line.coords)
+                last_idx = 0
+                for sp in simp.coords[1:-1]: # 양 끝점을 제외한 꺾임 지점
+                    dists = [Point(sp).distance(Point(c)) for c in coords]
+                    idx = np.argmin(dists)
+                    if idx > last_idx:
+                        split_lines.append(LineString(coords[last_idx:idx+1]))
+                        last_idx = idx
+                if last_idx < len(coords) - 1:
+                    split_lines.append(LineString(coords[last_idx:]))
+                return split_lines
+            return [line]
+
+        def point_to_line_dist(p, a, b):
+            ab = np.array(b) - np.array(a)
             ab_len = np.linalg.norm(ab)
-            if ab_len < 1e-9:
-                return np.linalg.norm(p - a)
-            ab_unit = ab / ab_len
-            ap = p - a
-            proj_len = np.dot(ap, ab_unit)
-            if proj_len < 0:
-                return np.linalg.norm(p - a)
-            elif proj_len > ab_len:
-                return np.linalg.norm(p - b)
-            else:
-                proj_point = a + proj_len * ab_unit
-                return np.linalg.norm(p - proj_point)
-        
-        # =====================================================================
-        # [수정] 매칭 조건(각도 허용치, 최소 겹침 길이)을 조절할 수 있도록 파라미터 추가
-        # =====================================================================
+            if ab_len < 1e-9: return np.linalg.norm(np.array(p) - np.array(a))
+            return np.abs(ab[0] * (a[1] - p[1]) - (a[0] - p[0]) * ab[1]) / ab_len
+
+        # 1102 레이어용 기존 매칭 (그대로 유지)
         def match_parallel_pairs_robust(lines, max_distance=100.0, angle_tol=5.0, min_overlap=30.0):
             if not lines: return []
             potential_pairs = []
             sorted_lines = sorted(lines, key=lambda x: x.length, reverse=True)
             covered_intervals = {i: [] for i in range(len(sorted_lines))}
-            
             for i, line1 in enumerate(sorted_lines):
                 c1 = list(line1.coords)
                 p1_start, p1_end = np.array(c1[0]), np.array(c1[-1])
+                mid1 = (p1_start + p1_end) / 2.0
                 v1 = p1_end - p1_start
                 len1 = np.linalg.norm(v1)
                 if len1 < 1e-6: continue
                 angle1 = np.degrees(np.arctan2(v1[1], v1[0])) % 180
                 v1_unit = v1 / len1
-                
                 for j, line2 in enumerate(sorted_lines):
                     if i == j: continue
                     c2 = list(line2.coords)
                     p2_start, p2_end = np.array(c2[0]), np.array(c2[-1])
+                    mid2 = (p2_start + p2_end) / 2.0
                     v2 = p2_end - p2_start
                     len2 = np.linalg.norm(v2)
                     if len2 < 1e-6: continue
                     angle2 = np.degrees(np.arctan2(v2[1], v2[0])) % 180
                     angle_diff = min(abs(angle1 - angle2), 180 - abs(angle1 - angle2))
-                    
-                    if angle_diff > angle_tol: continue # 변경됨
-                    
-                    d1 = perpendicular_distance(p2_start, p1_start, p1_end)
-                    d2 = perpendicular_distance(p2_end, p1_start, p1_end)
+                    if angle_diff > angle_tol: continue
+                    d1 = point_to_line_dist(mid1, p2_start, p2_end)
+                    d2 = point_to_line_dist(mid2, p1_start, p1_end)
                     avg_dist = (d1 + d2) / 2.0
                     if avg_dist > max_distance: continue
-                    
                     proj2_start = np.dot(p2_start - p1_start, v1_unit)
                     proj2_end = np.dot(p2_end - p1_start, v1_unit)
                     if proj2_start > proj2_end:
                         proj2_start, proj2_end = proj2_end, proj2_start
-                    overlap_start = max(0, proj2_start)
-                    overlap_end = min(len1, proj2_end)
-                    
-                    if overlap_start < overlap_end - 1e-3 and (overlap_end - overlap_start > min_overlap): # 변경됨
+                    overlap_start = max(-10.0, proj2_start)
+                    overlap_end = min(len1 + 10.0, proj2_end)
+                    if overlap_start < overlap_end and (overlap_end - overlap_start > min_overlap):
                         overlap_flag = False
                         for (cs, ce) in covered_intervals[i]:
                             if max(overlap_start, cs) < min(overlap_end, ce) - 1e-3:
                                 overlap_flag = True; break
                         if overlap_flag: continue
-                        
                         v2_unit = v2 / len2
                         proj1_start_l2 = np.dot(p1_start - p2_start, v2_unit)
                         proj1_end_l2 = np.dot(p1_end - p2_start, v2_unit)
                         if proj1_start_l2 > proj1_end_l2:
                             proj1_start_l2, proj1_end_l2 = proj1_end_l2, proj1_start_l2
-                        ov2_start = max(0, proj1_start_l2)
-                        ov2_end = min(len2, proj1_end_l2)
-                        
+                        ov2_start = max(-10.0, proj1_start_l2)
+                        ov2_end = min(len2 + 10.0, proj1_end_l2)
                         for (cs, ce) in covered_intervals[j]:
                             if max(ov2_start, cs) < min(ov2_end, ce) - 1e-3:
                                 overlap_flag = True; break
                         if overlap_flag: continue
-                        
-                        covered_intervals[i].append((overlap_start, overlap_end))
-                        covered_intervals[j].append((ov2_start, ov2_end))
-                        seg1_start = p1_start + v1_unit * overlap_start
-                        seg1_end = p1_start + v1_unit * overlap_end
-                        seg2_start = p2_start + v2_unit * ov2_start
-                        seg2_end = p2_start + v2_unit * ov2_end
+                        covered_intervals[i].append((max(0, proj2_start), min(len1, proj2_end)))
+                        covered_intervals[j].append((max(0, proj1_start_l2), min(len2, proj1_end_l2)))
+                        seg1_start = p1_start + v1_unit * max(0, proj2_start)
+                        seg1_end = p1_start + v1_unit * min(len1, proj2_end)
+                        seg2_start = p2_start + v2_unit * max(0, proj1_start_l2)
+                        seg2_end = p2_start + v2_unit * min(len2, proj1_end_l2)
                         potential_pairs.append({
                             'line1': LineString([tuple(seg1_start), tuple(seg1_end)]), 
                             'line2': LineString([tuple(seg2_start), tuple(seg2_end)]), 
                             'distance': avg_dist
                         })
+            return potential_pairs
+
+        # =====================================================================
+        # [신규] 157 전용 법선(Normal) 교차 검사 및 전체 기울기 기반 매칭
+        # =====================================================================
+        def match_157_by_normal_intersection(lines_157, max_dist=300.0, angle_tol=15.0):
+            pairs = []
+            consumed = set()
+            info = []
             
-            return [(p['line1'], p['line2'], p['distance']) for p in potential_pairs]
-        
+            # 각 선분의 '전체 기울기'를 구하여 정보 저장
+            for idx, l in enumerate(lines_157):
+                coords = list(l.coords)
+                p1, p2 = np.array(coords[0]), np.array(coords[-1])
+                v = p2 - p1
+                L = np.linalg.norm(v)
+                angle = np.degrees(np.arctan2(v[1], v[0])) % 180 if L > 1e-6 else 0
+                info.append({'idx': idx, 'line': l, 'angle': angle, 'v': v, 'L': L})
+                
+            for i in range(len(info)):
+                if i in consumed: continue
+                best_j = -1
+                best_dist = float('inf')
+                
+                for j in range(len(info)):
+                    if i == j or j in consumed: continue
+                    
+                    # 1. 기울기가 동일한지(허용치 내) 검사
+                    ang_diff = min(abs(info[i]['angle'] - info[j]['angle']), 
+                                   180 - abs(info[i]['angle'] - info[j]['angle']))
+                    if ang_diff > angle_tol: continue
+                        
+                    # 2. 한쪽 선분에서 법선을 그어 만나는 선이 있는지 확인
+                    v_i = info[i]['v']
+                    if info[i]['L'] < 1e-6: continue
+                    n_i = np.array([-v_i[1], v_i[0]]) / info[i]['L']
+                    line_j = info[j]['line']
+                    
+                    intersect_found = False
+                    # 선분의 1/4, 1/2, 3/4 지점에서 법선을 쏘아 하나라도 맞으면 OK
+                    for fract in [0.25, 0.5, 0.75]:
+                        pt = info[i]['line'].interpolate(fract, normalized=True)
+                        p_coord = np.array(pt.coords[0])
+                        ray = LineString([tuple(p_coord - n_i * max_dist), 
+                                          tuple(p_coord + n_i * max_dist)])
+                        if ray.intersects(line_j):
+                            intersect_found = True
+                            break
+                            
+                    if intersect_found:
+                        # 중심점끼리의 거리를 두께로 산정
+                        mid_i = np.array(info[i]['line'].interpolate(0.5, normalized=True).coords[0])
+                        dist = Point(mid_i).distance(line_j)
+                        if dist < best_dist:
+                            best_dist = dist
+                            best_j = j
+                            
+                if best_j != -1:
+                    consumed.add(i)
+                    consumed.add(best_j)
+                    pairs.append({
+                        'line1': info[i]['line'],
+                        'line2': info[best_j]['line'],
+                        'distance': best_dist
+                    })
+            return pairs
+
+        # =====================================================================
+        # [신규] 157 전용: 상대 선분을 향해 투영하여 중심선을 그리는 방식
+        # =====================================================================
+        def generate_centerline_for_157(p1, p2, dist):
+            l_long = p1 if p1.length > p2.length else p2
+            l_short = p2 if p1.length > p2.length else p1
+            
+            midpoints = []
+            num_samples = max(2, int(l_long.length / 50.0))
+            for i in range(num_samples + 1):
+                pt = l_long.interpolate(i / num_samples, normalized=True)
+                nt = nearest_points(pt, l_short)[1]
+                midpoints.append(((pt.x + nt.x) / 2.0, (pt.y + nt.y) / 2.0))
+            
+            # 계단 현상을 부드럽게 펴서 깔끔한 대각선으로 보정
+            cl = LineString(midpoints).simplify(10.0) 
+            if cl.is_empty or cl.geom_type != 'LineString':
+                cl = LineString([midpoints[0], midpoints[-1]])
+                
+            vec = np.array(cl.coords[-1]) - np.array(cl.coords[0])
+            angle = np.degrees(np.arctan2(vec[1], vec[0])) % 180
+            
+            return {
+                'line': cl, 'thickness': round(dist * 2) / 2.0,
+                'orientation': 'diagonal', 'angle': angle, 'type': '157'
+            }
+
         def generate_centerline_from_pair(line1, line2, distance):
             c1 = list(line1.coords)
             c2 = list(line2.coords)
+            v1 = np.array(c1[-1]) - np.array(c1[0])
+            v2 = np.array(c2[-1]) - np.array(c2[0])
+            if np.dot(v1, v2) < 0: c2.reverse()
+            
             center_coords = []
             for i in range(max(len(c1), len(c2))):
                 p1 = np.array(c1[min(i, len(c1)-1)])
@@ -680,8 +772,8 @@ class UltimateShipAnalyzer(QMainWindow):
                 mid_idx = len(coords) // 2
                 dists = []
                 for pt in [coords[0], coords[mid_idx], coords[-1]]:
-                    dd1 = perpendicular_distance(pt, c1[0], c1[-1])
-                    dd2 = perpendicular_distance(pt, c2[0], c2[-1])
+                    dd1 = point_to_line_dist(pt, c1[0], c1[-1])
+                    dd2 = point_to_line_dist(pt, c2[0], c2[-1])
                     dists.append(dd1 + dd2)
                 thickness = np.mean(dists)
             
@@ -868,6 +960,12 @@ class UltimateShipAnalyzer(QMainWindow):
             return new_centerlines, intersection_nodes
 
         def filter_parallel_duplicates(centerlines, proximity_threshold=10.0):
+            def point_dist(p, a, b):
+                ab = np.array(b) - np.array(a)
+                ab_len = np.linalg.norm(ab)
+                if ab_len < 1e-9: return np.linalg.norm(np.array(p) - np.array(a))
+                return np.abs(ab[0] * (a[1] - p[1]) - (a[0] - p[0]) * ab[1]) / ab_len
+
             if not centerlines: return centerlines, 0
             n = len(centerlines)
             remove_set = set()
@@ -891,8 +989,8 @@ class UltimateShipAnalyzer(QMainWindow):
                     angle_diff = min(abs(info_i['angle'] - info_j['angle']),
                                      180 - abs(info_i['angle'] - info_j['angle']))
                     if angle_diff > 5: continue
-                    d1 = perpendicular_distance(info_j['p1'], info_i['p1'], info_i['p2'])
-                    d2 = perpendicular_distance(info_j['p2'], info_i['p1'], info_i['p2'])
+                    d1 = point_dist(info_j['p1'], info_i['p1'], info_i['p2'])
+                    d2 = point_dist(info_j['p2'], info_i['p1'], info_i['p2'])
                     avg_dist = (d1 + d2) / 2.0
                     if avg_dist > proximity_threshold: continue
                     proj_s = np.dot(info_j['p1'] - info_i['p1'], info_i['unit'])
@@ -929,6 +1027,7 @@ class UltimateShipAnalyzer(QMainWindow):
                     except: pass
             return int_nodes
 
+        # 반경 30mm 이내의 노드를 묶는 토폴로지 구축
         def rebuild_topology_full(centerlines, int_nodes, radius=30.0):
             raw_endpoints = []
             for cl in centerlines:
@@ -1067,13 +1166,16 @@ class UltimateShipAnalyzer(QMainWindow):
             self.raw_swbm = float(self.txt_swbm.text())
             self.raw_shear = float(self.txt_shear_v.text())
 
-            progress.setLabelText("Step 1: Filtering noise (30mm)...")
-            filtered_157 = filter_short_segments(calc_157, min_length=30)
-            filtered_1102 = filter_short_segments(calc_1102_raw, min_length=30)
+            progress.setLabelText("Step 1: Filtering noise...")
+            filtered_157 = filter_short_segments(calc_157, min_length=10.0)
+            filtered_1102 = filter_short_segments(calc_1102_raw, min_length=30.0)
             
+            # =============================================================
+            # [사용자 로직 적용] 계단 무시하고 거시적 꺾임(기울기 변화)에서만 컷팅
+            # =============================================================
             split_157 = []
             for l in filtered_157:
-                split_157.extend([s for s in split_line_by_angle(l, 15.0) if s.length > 30.0])
+                split_157.extend(split_macroscopic_bends(l, tolerance=50.0))
                 
             split_1102 = []
             for l in filtered_1102:
@@ -1094,20 +1196,51 @@ class UltimateShipAnalyzer(QMainWindow):
             
             progress.setLabelText("Step 4: Matching pairs...")
             
-            # =====================================================================
-            # [수정] 157 레이어 전용 매칭: 거리 100mm, 각도 15도까지 허용, 겹침 10mm 허용
-            # =====================================================================
-            pairs_157 = match_parallel_pairs_robust(split_157, max_distance=100.0, angle_tol=15.0, min_overlap=10.0)
+            # =============================================================
+            # [사용자 로직 적용] 전체 기울기 비교 + 법선 교차 매칭
+            # =============================================================
+            pairs_157 = match_157_by_normal_intersection(split_157, max_dist=300.0, angle_tol=15.0)
             
-            # 1102 레이어는 기존 엄격한 조건 유지
+            # 1102 레이어는 기존 로직 유지
             pairs_1102 = match_parallel_pairs_robust(healed_1102, max_distance=100.0, angle_tol=5.0, min_overlap=30.0)
             
             dialog = PairViewerDialog(split_157, pairs_157, healed_1102, pairs_1102, self)
             dialog.exec()
 
             progress.setLabelText("Step 5: Generating centerlines...")
-            centerlines_157 = [generate_centerline_from_pair(p[0], p[1], p[2]) for p in pairs_157]
-            centerlines_1102 = [generate_centerline_from_pair(p[0], p[1], p[2]) for p in pairs_1102]
+            
+            # =============================================================
+            # [사용자 로직 적용] 157 전용 계단식 보간 중심선 생성
+            # =============================================================
+            centerlines_157 = [generate_centerline_for_157(p['line1'], p['line2'], p['distance']) for p in pairs_157]
+            centerlines_1102 = [generate_centerline_from_pair(p['line1'], p['line2'], p['distance']) for p in pairs_1102]
+            
+            def rescue_unmatched_segments(original_lines, pairs, layer_type, default_thk=10.0):
+                rescued = []
+                matched_segments = []
+                for p in pairs:
+                    matched_segments.extend([p['line1'], p['line2']])
+                
+                matched_union = unary_union([seg.buffer(1.0) for seg in matched_segments]) if matched_segments else Polygon()
+                
+                for orig_line in original_lines:
+                    try:
+                        diff = orig_line.difference(matched_union)
+                        if diff.is_empty: continue
+                        
+                        geoms = list(diff.geoms) if hasattr(diff, 'geoms') else [diff]
+                        for geom in geoms:
+                            if geom.geom_type == 'LineString' and geom.length > 5.0:
+                                rescued.append({
+                                    'line': geom, 'thickness': default_thk,
+                                    'type': layer_type, 'orientation': 'diagonal', 'angle': 0
+                                })
+                    except: pass
+                return rescued
+
+            rescued_157 = rescue_unmatched_segments(split_157, pairs_157, '157')
+            centerlines_157.extend(rescued_157)
+
             for cl in centerlines_157: cl['type'] = '157'
             for cl in centerlines_1102: cl['type'] = '1102'
             all_centerlines = lines_1999_final + centerlines_157 + centerlines_1102
@@ -1129,6 +1262,7 @@ class UltimateShipAnalyzer(QMainWindow):
             fresh_int_nodes = recompute_fresh_intersections(all_centerlines)
 
             progress.setLabelText("Step 11: Building topology...")
+            # 30mm 이내의 선분 동일 노드 취급
             topo_data = rebuild_topology_full(all_centerlines, fresh_int_nodes, radius=30.0)
 
             progress.setLabelText("Step 12: Filtering orphan nodes (iterative)...")
@@ -1473,7 +1607,6 @@ class UltimateShipAnalyzer(QMainWindow):
                 ax2.plot(nx, ny, 'ro', markersize=5, markeredgecolor='white',
                         markeredgewidth=1, label=f'Nodes ({len(self.nodes)})', zorder=11)
             
-            # [수정] 범례에 추가할 데이터가 있을 때만 legend() 호출하여 경고 제거
             handles, labels = ax2.get_legend_handles_labels()
             if handles:
                 ax2.legend(loc="upper right", fontsize=8)
