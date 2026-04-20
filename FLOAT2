@@ -66,6 +66,7 @@ class CenterlineViewerDialog(QDialog):
             elif ct == '1999': color = '#FF00FF'
             elif ct == 'bridge': color = '#00CC00'
             else: color = '#AAAAAA'
+        
             ax.plot(*cl['line'].xy, color=color, linewidth=2.5, linestyle='-', alpha=0.8)
             thk = cl.get('thickness', 0)
             if thk > 0:
@@ -81,6 +82,50 @@ class CenterlineViewerDialog(QDialog):
         canvas.draw()
 
 
+class LoopViewerDialog(QDialog):
+    def __init__(self, centerlines, loops, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("디버깅: 폐단면(다중 셀) 검출 확인")
+        self.resize(1000, 700)
+        layout = QVBoxLayout(self)
+
+        lbl = QLabel("<b>[시각화 가이드]</b><br>"
+                     "회색 선: 1D 중심선 네트워크<br>"
+                     "색상 영역: 독립된 폐단면(Cell)으로 인식된 루프들")
+        layout.addWidget(lbl)
+
+        fig = Figure()
+        canvas = FigureCanvas(fig)
+        toolbar = NavigationToolbar(canvas, self)
+        layout.addWidget(toolbar)
+        layout.addWidget(canvas, stretch=1)
+
+        btn = QPushButton("닫기")
+        btn.setFixedHeight(40)
+        btn.setStyleSheet("background-color: #8E44AD; color: white; font-weight: bold; font-size: 14px;")
+        btn.clicked.connect(self.close)
+        layout.addWidget(btn)
+
+        ax = fig.add_subplot(111)
+        ax.set_aspect('equal')
+        ax.grid(True, linestyle=':', alpha=0.6)
+
+        for cl in centerlines:
+            ax.plot(*cl['line'].xy, color='gray', linewidth=1.5, alpha=0.6)
+
+        cmap = matplotlib.colormaps.get_cmap('tab20')
+        for idx, poly in enumerate(loops):
+            color = cmap(idx % 20)
+            ax.fill(*poly.exterior.xy, color=color, alpha=0.4)
+            ax.plot(*poly.exterior.xy, color=color, linewidth=2.5)
+            
+            cx, cy = poly.centroid.x, poly.centroid.y
+            ax.text(cx, cy, f"Cell {idx+1}", color='black', fontsize=11, fontweight='bold',
+                    ha='center', va='center', bbox=dict(facecolor='white', alpha=0.8, edgecolor='black', boxstyle='round,pad=0.3'))
+
+        canvas.draw()
+
+
 class UltimateShipAnalyzer(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -92,116 +137,178 @@ class UltimateShipAnalyzer(QMainWindow):
         self.init_ui()
 
     def reset_analysis_data(self):
-        self.raw_1999_lines = []; self.left_1999_segments = []
-        self.lines_1102_raw = []; self.lines_1102 = []; self.lines_157 = []
-        self.lines_6001 = []; self.lines_7001 = []; self.lines_9001 = []
-        self.lines_minus1204 = []; self.hull_centroid = Point(0, 0)
-        self.shell_thickness_inputs = []; self.calculated_polygons = []
-        self.poly_layer_map = {}; self.is_calculated = False
-        self.shear_flows = []; self.mesh_cells = []
-        self.centerlines = []; self.nodes = []
-        self.single_nodes = []; self.merged_nodes = []
-        self.topological_nodes = []; self.topological_edges = []
-        self.max_shell_q_idx = -1; self.max_shell_thk = 0.0
-        self.q_per_v = 0.0; self.max_Q = 0.0
-        self.calc_na_bl = 0.0; self.calc_depth = 0.0; self.base_report = ""
-        self.act_fb = 0.0; self.act_fs = 0.0; self.allow_fb = 0.0; self.allow_fs = 0.0
-        self.raw_swbm = 0.0; self.raw_shear = 0.0
+        self.raw_1999_lines = []
+        self.left_1999_segments = []
+        self.lines_1102_raw = []
+        self.lines_1102 = []
+        self.lines_157 = []
+        self.lines_6001 = []
+        self.lines_7001 = []
+        self.lines_9001 = []
+        self.lines_minus1204 = []
+        self.hull_centroid = Point(0, 0)
+        self.shell_thickness_inputs = []
+        self.calculated_polygons = []
+        self.poly_layer_map = {}
+        self.is_calculated = False
+        self.shear_flows = []
+        self.mesh_cells = []
+        self.centerlines = []
+        self.nodes = []
+        self.single_nodes = []
+        self.merged_nodes = []
+        self.topological_nodes = []
+        self.topological_edges = []
+        self.max_shell_q_idx = -1
+        self.max_shell_thk = 0.0
+        self.q_per_v = 0.0
+        self.max_Q = 0.0
+        self.calc_na_bl = 0.0
+        self.calc_depth = 0.0
+        self.base_report = ""
+        self.act_fb = 0.0
+        self.act_fs = 0.0
+        self.allow_fb = 0.0
+        self.allow_fs = 0.0
+        self.raw_swbm = 0.0
+        self.raw_shear = 0.0
 
     def init_ui(self):
-        main_scroll = QScrollArea(); main_scroll.setWidgetResizable(True)
-        main_container = QWidget(); main_layout = QHBoxLayout(main_container)
+        main_scroll = QScrollArea()
+        main_scroll.setWidgetResizable(True)
+        main_container = QWidget()
+        main_layout = QHBoxLayout(main_container)
         self.input_style = "background-color: white; color: black; border: 1px solid #ABB2B9; padding: 2px;"
         self.field_width = 100
-        control_panel = QWidget(); control_panel.setFixedWidth(300)
-        cpl = QVBoxLayout(control_panel); cpl.setAlignment(Qt.AlignTop)
+        control_panel = QWidget()
+        control_panel.setFixedWidth(300)
+        cpl = QVBoxLayout(control_panel)
+        cpl.setAlignment(Qt.AlignTop)
 
         gen_box = QFrame()
         gen_box.setStyleSheet("background: #F2F4F4; border-radius: 5px; padding: 5px;")
-        gv = QVBoxLayout(gen_box); gv.addWidget(QLabel("<b>[General Settings]</b>"))
+        gv = QVBoxLayout(gen_box)
+        gv.addWidget(QLabel("<b>[General Settings]</b>"))
         for lbl, attr, dv in [("Scale:", "txt_scale", "100"), ("H-Ext (mm):", "txt_ext", "10"),
                                ("V-Ext (mm):", "txt_perp", "10")]:
-            h = QHBoxLayout(); h.addWidget(QLabel(lbl)); h.addStretch()
-            le = QLineEdit(dv); le.setFixedWidth(self.field_width); le.setStyleSheet(self.input_style)
-            setattr(self, attr, le); h.addWidget(le); gv.addLayout(h)
+            h = QHBoxLayout()
+            h.addWidget(QLabel(lbl)); h.addStretch()
+            le = QLineEdit(dv); le.setFixedWidth(self.field_width)
+            le.setStyleSheet(self.input_style)
+            setattr(self, attr, le); h.addWidget(le)
+            gv.addLayout(h)
         cpl.addWidget(gen_box)
 
-        self.btn_load = QPushButton("1. DXF Load 📂"); self.btn_load.setFixedHeight(40)
+        self.btn_load = QPushButton("1. DXF Load 📂")
+        self.btn_load.setFixedHeight(40)
         self.btn_load.setStyleSheet("background-color: #2E86C1; color: white; font-weight: bold; margin-top: 5px; margin-bottom: 5px;")
-        self.btn_load.clicked.connect(self.load_and_process_dxf); cpl.addWidget(self.btn_load)
+        self.btn_load.clicked.connect(self.load_and_process_dxf)
+        cpl.addWidget(self.btn_load)
 
         struct_box = QFrame()
         struct_box.setStyleSheet("background: #FEF9E7; border-radius: 5px; padding: 5px;")
-        sv = QVBoxLayout(struct_box); sv.addWidget(QLabel("<b>[Structural Category]</b>"))
+        sv = QVBoxLayout(struct_box)
+        sv.addWidget(QLabel("<b>[Structural Category]</b>"))
         for lbl, attr, items in [("Selection window:", "combo_section", ["continuous section", "discontinuous section"]),
                                   ("creation window:", "combo_hull", ["mild", "H.T", "H.T with BKT"])]:
-            h = QHBoxLayout(); h.addWidget(QLabel(lbl)); h.addStretch()
-            cb = QComboBox(); cb.addItems(items); cb.setFixedWidth(self.field_width); cb.setStyleSheet(self.input_style)
-            setattr(self, attr, cb); h.addWidget(cb); sv.addLayout(h)
+            h = QHBoxLayout()
+            h.addWidget(QLabel(lbl)); h.addStretch()
+            cb = QComboBox(); cb.addItems(items); cb.setFixedWidth(self.field_width)
+            cb.setStyleSheet(self.input_style)
+            setattr(self, attr, cb); h.addWidget(cb)
+            sv.addLayout(h)
         cpl.addWidget(struct_box)
 
         shear_box = QFrame()
         shear_box.setStyleSheet("background: #EBF5FB; border-radius: 5px; padding: 5px; margin-top: 10px;")
-        shv = QVBoxLayout(shear_box); shv.addWidget(QLabel("<b>[Loading Setting]</b>"))
+        shv = QVBoxLayout(shear_box)
+        shv.addWidget(QLabel("<b>[Loading Setting]</b>"))
         for lbl, attr, dv in [("S.W.B.M (tm):", "txt_swbm", "0"), ("Shear (t):", "txt_shear_v", "10"),
                                ("Grade (K):", "txt_grade_k", "1.00")]:
-            h = QHBoxLayout(); h.addWidget(QLabel(lbl)); h.addStretch()
-            le = QLineEdit(dv); le.setFixedWidth(self.field_width); le.setStyleSheet(self.input_style)
-            setattr(self, attr, le); h.addWidget(le); shv.addLayout(h)
+            h = QHBoxLayout()
+            h.addWidget(QLabel(lbl)); h.addStretch()
+            le = QLineEdit(dv); le.setFixedWidth(self.field_width)
+            le.setStyleSheet(self.input_style)
+            setattr(self, attr, le); h.addWidget(le)
+            shv.addLayout(h)
         cpl.addWidget(shear_box)
 
         cpl.addWidget(QLabel("<b>[S/SHELL Thickness (mm)]</b>"))
-        self.thickness_scroll = QScrollArea(); self.thickness_scroll.setWidgetResizable(True)
+        self.thickness_scroll = QScrollArea()
+        self.thickness_scroll.setWidgetResizable(True)
         self.thickness_scroll.setMinimumHeight(200)
         self.scroll_content = QWidget()
-        self.thickness_layout = QVBoxLayout(self.scroll_content); self.thickness_layout.setAlignment(Qt.AlignTop)
+        self.thickness_layout = QVBoxLayout(self.scroll_content)
+        self.thickness_layout.setAlignment(Qt.AlignTop)
         self.thickness_scroll.setWidget(self.scroll_content); cpl.addWidget(self.thickness_scroll)
 
-        self.btn_calc = QPushButton("2. Cross Section Analysis 🧮"); self.btn_calc.setFixedHeight(50)
+        self.btn_calc = QPushButton("2. Cross Section Analysis 🧮")
+        self.btn_calc.setFixedHeight(50)
         self.btn_calc.setStyleSheet("background-color: #28B463; color: white; font-weight: bold; font-size: 14px; margin-top: 5px;")
-        self.btn_calc.clicked.connect(self.calculate_total_inertia); cpl.addWidget(self.btn_calc)
+        self.btn_calc.clicked.connect(self.calculate_total_inertia)
+        cpl.addWidget(self.btn_calc)
 
         eval_box = QFrame()
         eval_box.setStyleSheet("background: #FADBD8; border-radius: 5px; padding: 5px; margin-top: 10px;")
-        ev = QVBoxLayout(eval_box); ev.addWidget(QLabel("<b>[Post-Calc Evaluation]</b>"))
-        hm = QHBoxLayout(); hm.addWidget(QLabel("Material:")); hm.addStretch()
+        ev = QVBoxLayout(eval_box)
+        ev.addWidget(QLabel("<b>[Post-Calc Evaluation]</b>"))
+        hm = QHBoxLayout(); hm.addWidget(QLabel("Material:"))
+        hm.addStretch()
         self.combo_material_type = QComboBox()
         self.combo_material_type.addItems(["Mild", "H.T", "H.T with BKT"])
-        self.combo_material_type.setFixedWidth(self.field_width); hm.addWidget(self.combo_material_type)
+        self.combo_material_type.setFixedWidth(self.field_width)
+        hm.addWidget(self.combo_material_type)
         ev.addLayout(hm)
-        self.btn_eval = QPushButton("3. STRENGTH Analysis ⛓️"); self.btn_eval.setFixedHeight(40)
+        self.btn_eval = QPushButton("3. STRENGTH Analysis ⛓️")
+        self.btn_eval.setFixedHeight(40)
         self.btn_eval.setStyleSheet("background-color: #E67E22; color: white; font-weight: bold;")
-        self.btn_eval.setEnabled(False); self.btn_eval.clicked.connect(self.evaluate_strength)
+        self.btn_eval.setEnabled(False)
+        self.btn_eval.clicked.connect(self.evaluate_strength)
         ev.addWidget(self.btn_eval); cpl.addWidget(eval_box)
         main_layout.addWidget(control_panel)
 
-        work_area = QWidget(); wl = QVBoxLayout(work_area)
+        work_area = QWidget()
+        wl = QVBoxLayout(work_area)
         viz_splitter = QSplitter(Qt.Horizontal)
         for i, title in enumerate(["[Cross Section View]", "[1D Lines & Nodes]"]):
-            container = QWidget(); lay = QVBoxLayout(container); lay.addWidget(QLabel(f"<b>{title}</b>"))
-            fig = Figure(); can = FigureCanvas(fig)
-            lay.addWidget(NavigationToolbar(can, self)); lay.addWidget(can, stretch=1)
-            setattr(self, f"fig{i+1}", fig); setattr(self, f"can{i+1}", can)
+            container = QWidget()
+            lay = QVBoxLayout(container); lay.addWidget(QLabel(f"<b>{title}</b>"))
+            fig = Figure()
+            can = FigureCanvas(fig)
+            lay.addWidget(NavigationToolbar(can, self))
+            lay.addWidget(can, stretch=1)
+            setattr(self, f"fig{i+1}", fig)
+            setattr(self, f"can{i+1}", can)
             viz_splitter.addWidget(container)
         wl.addWidget(viz_splitter, stretch=7)
-        self.result_box = QTextEdit(); self.result_box.setReadOnly(True); self.result_box.setFixedHeight(270)
+        self.result_box = QTextEdit()
+        self.result_box.setReadOnly(True); self.result_box.setFixedHeight(270)
         self.result_box.setStyleSheet("font-family: 'Consolas'; font-size: 13px;")
-        wl.addWidget(self.result_box); main_layout.addWidget(work_area, stretch=7)
+        wl.addWidget(self.result_box)
+        main_layout.addWidget(work_area, stretch=7)
 
-        hp = QWidget(); hp.setFixedWidth(300); hl = QVBoxLayout(hp); hl.setAlignment(Qt.AlignTop)
+        hp = QWidget(); hp.setFixedWidth(300); hl = QVBoxLayout(hp)
+        hl.setAlignment(Qt.AlignTop)
         hl.addWidget(QLabel("<b>[Saved Frames for Excel]</b>"))
-        self.history_scroll = QScrollArea(); self.history_scroll.setWidgetResizable(True)
+        self.history_scroll = QScrollArea()
+        self.history_scroll.setWidgetResizable(True)
         self.history_content = QWidget()
-        self.history_list_layout = QVBoxLayout(self.history_content); self.history_list_layout.setAlignment(Qt.AlignTop)
+        self.history_list_layout = QVBoxLayout(self.history_content)
+        self.history_list_layout.setAlignment(Qt.AlignTop)
         self.history_scroll.setWidget(self.history_content); hl.addWidget(self.history_scroll, stretch=1)
-        self.btn_save_frame = QPushButton("4. Add Frame to List 💾"); self.btn_save_frame.setFixedHeight(40)
+        self.btn_save_frame = QPushButton("4. Add Frame to List 💾")
+        self.btn_save_frame.setFixedHeight(40)
         self.btn_save_frame.setStyleSheet("background-color: #3498DB; color: white; font-weight: bold;")
-        self.btn_save_frame.clicked.connect(self.save_current_frame); self.btn_save_frame.setEnabled(False)
+        self.btn_save_frame.clicked.connect(self.save_current_frame)
+        self.btn_save_frame.setEnabled(False)
         hl.addWidget(self.btn_save_frame)
-        self.btn_export_excel = QPushButton("5. Export All to Excel 📊"); self.btn_export_excel.setFixedHeight(40)
+        self.btn_export_excel = QPushButton("5. Export All to Excel 📊")
+        self.btn_export_excel.setFixedHeight(40)
         self.btn_export_excel.setStyleSheet("background-color: #1E8449; color: white; font-weight: bold; margin-top: 5px;")
-        self.btn_export_excel.clicked.connect(self.export_to_excel); hl.addWidget(self.btn_export_excel)
-        main_layout.addWidget(hp); main_scroll.setWidget(main_container); self.setCentralWidget(main_scroll)
+        self.btn_export_excel.clicked.connect(self.export_to_excel)
+        hl.addWidget(self.btn_export_excel)
+        main_layout.addWidget(hp); main_scroll.setWidget(main_container)
+        self.setCentralWidget(main_scroll)
 
     def _extract_pts(self, e, scale):
         try:
@@ -214,13 +321,18 @@ class UltimateShipAnalyzer(QMainWindow):
 
     def heal_1102_collinear(self, lines, threshold_gap=150.0):
         if not lines: return []
-        bridges = []; groups = {}
+        bridges = []
+        groups = {}
         for l in lines:
-            c = list(l.coords); p1, p2 = np.array(c[0]), np.array(c[-1])
-            v = p2 - p1; L = np.linalg.norm(v)
+            c = list(l.coords)
+            p1, p2 = np.array(c[0]), np.array(c[-1])
+            v = p2 - p1
+            L = np.linalg.norm(v)
             if L < 1e-6: continue
-            a = np.degrees(np.arctan2(v[1], v[0])) % 180.0; ak = round(a, 0)
-            th = np.radians(ak); rho = round((-p1[0]*np.sin(th) + p1[1]*np.cos(th))/10.0)*10.0
+            a = np.degrees(np.arctan2(v[1], v[0])) % 180.0
+            ak = round(a, 0)
+            th = np.radians(ak)
+            rho = round((-p1[0]*np.sin(th) + p1[1]*np.cos(th))/10.0)*10.0
             key = (ak, rho)
             if key not in groups: groups[key] = []
             groups[key].append((l, p1, p2))
@@ -238,8 +350,10 @@ class UltimateShipAnalyzer(QMainWindow):
 
     def generate_outward_thickness(self, line, thickness):
         try:
-            coords = list(line.coords); p1, p2 = np.array(coords[0]), np.array(coords[-1])
-            v = p2 - p1; length = np.linalg.norm(v)
+            coords = list(line.coords)
+            p1, p2 = np.array(coords[0]), np.array(coords[-1])
+            v = p2 - p1
+            length = np.linalg.norm(v)
             if length == 0: return line.buffer(thickness/2.0)
             nx, ny = -(v[1]/length), v[0]/length
             cx, cy = self.hull_centroid.x, self.hull_centroid.y
@@ -252,14 +366,16 @@ class UltimateShipAnalyzer(QMainWindow):
     def load_and_process_dxf(self):
         fname, _ = QFileDialog.getOpenFileName(self, 'Select DXF File', '', 'DXF files (*.dxf)')
         if not fname: return
-        self.reset_analysis_data(); self.result_box.clear(); self.current_dxf_path = fname
+        self.reset_analysis_data()
+        self.result_box.clear(); self.current_dxf_path = fname
         try:
             scale = float(self.txt_scale.text())
             try: doc = ezdxf.readfile(fname, encoding='utf-8')
             except: doc = ezdxf.readfile(fname, encoding='cp949')
             msp = doc.modelspace()
             active = {l.dxf.name for l in doc.layers if l.is_on() and not l.is_frozen()}
-            t1999, t1204 = [], []; tl = {"-1102": [], "157": []}
+            t1999, t1204 = [], []
+            tl = {"-1102": [], "157": []}
             for e in msp:
                 layer = e.dxf.layer.strip()
                 if layer not in active: continue
@@ -270,17 +386,19 @@ class UltimateShipAnalyzer(QMainWindow):
                 elif layer == "-1204": t1204.append(ls)
                 elif layer in tl: tl[layer].append(ls)
             if t1999:
-                u = unary_union(t1999); self.cx, self.cy_base = u.centroid.x, u.bounds[1]
+                u = unary_union(t1999)
+                self.cx, self.cy_base = u.centroid.x, u.bounds[1]
             else: self.cx = self.cy_base = 0.0
             shift = lambda ls: LineString([(p[0]-self.cx, p[1]-self.cy_base) for p in ls.coords])
             self.raw_1999_lines = [shift(ls) for ls in t1999]
             self.lines_minus1204 = [shift(ls) for ls in t1204]
-            m1999 = unary_union(self.raw_1999_lines); self.hull_centroid = m1999.centroid
+            m1999 = unary_union(self.raw_1999_lines)
+            self.hull_centroid = m1999.centroid
             cutters = [LineString([tuple(np.array(c.coords[0])-20), tuple(np.array(c.coords[-1])+20)]) for c in self.lines_minus1204]
             sr = split(m1999, unary_union(cutters)) if cutters else m1999
             pieces = list(sr.geoms) if hasattr(sr, 'geoms') else [sr]
             self.left_1999_segments = sorted([g for g in pieces if g.centroid.x <= 0.1 and g.length > 0.1],
-                                              key=lambda s: (-round(s.centroid.y, 2), s.centroid.x))
+                               key=lambda s: (-round(s.centroid.y, 2), s.centroid.x))
             self.lines_1102_raw = [shift(ls) for ls in tl["-1102"]]
             self.lines_157 = [shift(ls) for ls in tl["157"]]
             self.refresh_ui()
@@ -290,8 +408,10 @@ class UltimateShipAnalyzer(QMainWindow):
 
     def calculate_total_inertia(self):
         progress = QProgressDialog("Processing...", "Cancel", 0, 100, self)
-        progress.setWindowTitle("Processing"); progress.setWindowModality(Qt.WindowModal)
-        progress.setAutoClose(False); progress.show(); QApplication.processEvents()
+        progress.setWindowTitle("Processing")
+        progress.setWindowModality(Qt.WindowModal)
+        progress.setAutoClose(False); progress.show()
+        QApplication.processEvents()
 
         # =================================================================
         # 헬퍼 함수
@@ -300,19 +420,26 @@ class UltimateShipAnalyzer(QMainWindow):
             return [l for l in lines if l.length >= ml]
 
         def remove_overlapping(lines, dt=10.0, at=5.0):
-            lines = sorted(lines, key=lambda x: x.length, reverse=True); kept = []
+            lines = sorted(lines, key=lambda x: x.length, reverse=True)
+            kept = []
             for l in lines:
-                c = list(l.coords); ps, pe = np.array(c[0]), np.array(c[-1])
-                v = pe - ps; ln = np.linalg.norm(v)
+                c = list(l.coords)
+                ps, pe = np.array(c[0]), np.array(c[-1])
+                v = pe - ps
+                ln = np.linalg.norm(v)
                 if ln < 1e-6: continue
-                ang = np.degrees(np.arctan2(v[1], v[0])) % 180; dup = False
+                ang = np.degrees(np.arctan2(v[1], v[0])) % 180
+                dup = False
                 for k in kept:
-                    ck = list(k.coords); pk1, pk2 = np.array(ck[0]), np.array(ck[-1])
-                    vk = pk2 - pk1; lk = np.linalg.norm(vk)
+                    ck = list(k.coords)
+                    pk1, pk2 = np.array(ck[0]), np.array(ck[-1])
+                    vk = pk2 - pk1
+                    lk = np.linalg.norm(vk)
                     if lk < 1e-6: continue
                     ak = np.degrees(np.arctan2(vk[1], vk[0])) % 180
                     if min(abs(ang-ak), 180-abs(ang-ak)) > at: continue
-                    vu = vk/lk; mid = (ps+pe)/2.0
+                    vu = vk/lk
+                    mid = (ps+pe)/2.0
                     if np.linalg.norm(mid - (pk1 + np.dot(mid-pk1, vu)*vu)) > dt: continue
                     t1, t2 = np.dot(ps-pk1, vu), np.dot(pe-pk1, vu)
                     if min(lk, max(t1,t2)) - max(0, min(t1,t2)) > ln*0.8: dup = True; break
@@ -322,7 +449,8 @@ class UltimateShipAnalyzer(QMainWindow):
         def split_by_slope(line, at=5.0):
             coords = list(line.coords)
             if len(coords) < 3: return [line]
-            segs = []; cur = [coords[0]]
+            segs = []
+            cur = [coords[0]]
             for i in range(1, len(coords)-1):
                 cur.append(coords[i])
                 v1 = np.array(coords[i]) - np.array(coords[i-1])
@@ -335,20 +463,20 @@ class UltimateShipAnalyzer(QMainWindow):
             if len(cur) >= 2: segs.append(LineString(cur))
             return segs
 
-        # =============================================================
-        # [핵심 수정] match_pairs: 계단부 5mm 겹침 허용
-        # =============================================================
         def match_pairs(lines, max_dist=100.0, angle_tol=20.0, overlap_tolerance=5.0):
             if not lines: return []
             ls_sorted = sorted(lines, key=lambda x: x.length)
             meta = []
             for l in ls_sorted:
-                c = list(l.coords); ps, pe = np.array(c[0]), np.array(c[-1])
-                v = pe - ps; ln = np.linalg.norm(v)
+                c = list(l.coords)
+                ps, pe = np.array(c[0]), np.array(c[-1])
+                v = pe - ps
+                ln = np.linalg.norm(v)
                 if ln < 1e-6: meta.append(None); continue
                 meta.append({'ps': ps, 'pe': pe, 'v': v, 'ln': ln,
                              'unit': v/ln, 'ang': np.degrees(np.arctan2(v[1], v[0])) % 180,
                              'mid': (ps+pe)/2.0})
+            
             used = {i: [] for i in range(len(ls_sorted))}
             pairs = []
             for i in range(len(ls_sorted)):
@@ -371,7 +499,7 @@ class UltimateShipAnalyzer(QMainWindow):
                     t2 = np.dot(mi['pe'] - mj['ps'], mj['unit'])
                     ov_s, ov_e = max(0, min(t1,t2)), min(mj['ln'], max(t1,t2))
                     if (ov_e - ov_s) < mi['ln'] * 0.5: continue
-                    # [수정] 계단부 겹침 허용: 기존 구간과 겹치는 길이가 overlap_tolerance 이하면 통과
+                    # 계단부 겹침 허용
                     is_blocked = False
                     for (us, ue) in used[j]:
                         overlap_len = min(ov_e, ue) - max(ov_s, us)
@@ -384,9 +512,6 @@ class UltimateShipAnalyzer(QMainWindow):
                     pairs.append((i, best_j, best_ov, best_d))
             return [(ls_sorted[i], ls_sorted[j], ov, dist) for i, j, ov, dist in pairs]
 
-        # =============================================================
-        # [핵심 수정] create_centerlines: Unclamped 투영으로 절곡부 왜곡 방지
-        # =============================================================
         def create_centerlines(pairs):
             result = []
             for short_line, long_line, (ov_s, ov_e), dist in pairs:
@@ -403,13 +528,8 @@ class UltimateShipAnalyzer(QMainWindow):
                 mids = []
                 for frac in np.linspace(0, 1, 5):
                     pt_s = ps1 + (ps2 - ps1) * frac
-
-                    # [수정] Unclamped 투영: 무한선 위의 수선의 발
-                    #   기존: t_clamped = clip(t, 0, ll) → 절곡부에서 왜곡
-                    #   수정: t를 그대로 사용하여 정확한 수선의 발 위치 확보
                     t = np.dot(pt_s - pl1, vl_u)
                     pt_l = pl1 + t * vl_u  # clamping 없음
-
                     mids.append(tuple((pt_s + pt_l) / 2.0))
 
                 thickness = round(dist * 2) / 2.0
@@ -444,15 +564,22 @@ class UltimateShipAnalyzer(QMainWindow):
                         for pt in pts:
                             dd = np.linalg.norm(np.array([pt.x, pt.y]) - p)
                             if 1e-3 < dd < bd: bd = dd; bp = (pt.x, pt.y)
+                    
                     if bp:
-                        if ei == 0: coords[0] = bp
-                        else: coords[-1] = bp
+                        # [핵심 수정] T-Junction 누수 방지를 위한 1.0mm 고의 오버슈트(Overshoot) 적용
+                        # 이후 진행되는 unary_union이 교차점(Crossing)을 완벽한 노드로 분할하도록 강제함
+                        overshoot = 1.0
+                        bp_overshot = (bp[0] + d[0] * overshoot, bp[1] + d[1] * overshoot)
+                        
+                        if ei == 0: coords[0] = bp_overshot
+                        else: coords[-1] = bp_overshot
                         extended_pts.add((round(bp[0], 2), round(bp[1], 2)))
+                        
                 result.append({'line': LineString(coords), 'thickness': cl['thickness'],
                                'type': cl.get('type', 'internal')})
             return result, extended_pts
 
-        def bridge_open_nodes(centerlines, extended_pts, max_gap=30.0):
+        def bridge_open_nodes(centerlines, extended_pts, max_gap=100.0):
             ep_map = defaultdict(list)
             for idx, cl in enumerate(centerlines):
                 coords = list(cl['line'].coords)
@@ -565,12 +692,12 @@ class UltimateShipAnalyzer(QMainWindow):
                 l1999f.append({'line': ls, 'thickness': ta, 'type': '1999'})
                 l1999f.append({'line': affinity.scale(ls, xfact=-1.0, origin=(0,0)), 'thickness': ta, 'type': '1999'})
 
-            progress.setLabelText("Step 2: Healing -1102...")
-            h1102 = self.heal_1102_collinear(c1102, threshold_gap=150)
-
-            progress.setLabelText("Step 3: Pre-filtering...")
-            f1102 = remove_overlapping(filter_short(h1102, 100.0))
+            progress.setLabelText("Step 2: Pre-filtering...")
+            f1102 = remove_overlapping(filter_short(c1102, 100.0))
             f157 = remove_overlapping(filter_short(c157, 100.0))
+
+            progress.setLabelText("Step 3: Healing -1102...")
+            h1102 = self.heal_1102_collinear(f1102, threshold_gap=150)
 
             progress.setLabelText("Step 4: Splitting 157 at slope changes...")
             s157 = []
@@ -578,7 +705,7 @@ class UltimateShipAnalyzer(QMainWindow):
             s157 = [s for s in s157 if s.length >= 30.0]
 
             progress.setLabelText("Step 5: Pair matching (with 5mm step tolerance)...")
-            p1102 = match_pairs(f1102, max_dist=100.0, angle_tol=20.0, overlap_tolerance=5.0)
+            p1102 = match_pairs(h1102, max_dist=100.0, angle_tol=20.0, overlap_tolerance=5.0)
             p157 = match_pairs(s157, max_dist=100.0, angle_tol=20.0, overlap_tolerance=5.0)
 
             progress.setLabelText("Step 6: Creating centerlines (unclamped projection)...")
@@ -592,8 +719,8 @@ class UltimateShipAnalyzer(QMainWindow):
             progress.setLabelText("Step 7: Ray-casting (≤50mm)...")
             all_cl, ext_pts = raycast_extend(all_cl, max_dist=50.0)
 
-            progress.setLabelText("Step 8: Bridging open nodes (≤30mm)...")
-            all_cl, bc = bridge_open_nodes(all_cl, ext_pts, max_gap=30.0)
+            progress.setLabelText("Step 8: Bridging open nodes (≤100mm)...")
+            all_cl, bc = bridge_open_nodes(all_cl, ext_pts, max_gap=100.0)
 
             progress.setLabelText("Step 9: Filtering redundant nodes...")
             prev = -1
@@ -612,8 +739,28 @@ class UltimateShipAnalyzer(QMainWindow):
 
             self.dialog_cl = CenterlineViewerDialog(f157, f1102, all_cl, nodes, self)
             self.dialog_cl.show()
-            self.centerlines = all_cl; self.nodes = nodes
-            self.single_nodes = []; self.merged_nodes = []; self.topological_edges = []
+            self.centerlines = all_cl
+            self.nodes = nodes
+            self.single_nodes = []
+            self.merged_nodes = []
+            self.topological_edges = []
+
+            # =============================================================
+            # 폐단면(Closed Loop/Cell) 인식 및 시각화
+            # =============================================================
+            progress.setLabelText("Step 10: Detecting closed loops (Cells)...")
+            line_geoms = [cl['line'] for cl in all_cl]
+            
+            # [핵심 보완] 미세 부동소수점 오차 방지
+            # 오버슈트(Overshoot)가 적용된 선분들을 교차점 기준으로 완벽하게 잘라(Node) 평면화
+            planarized_network = unary_union(line_geoms)
+            
+            # 갇힌 다각형 구역 추출
+            detected_loops = list(polygonize(planarized_network))
+            self.mesh_cells = detected_loops
+            
+            self.dialog_loop = LoopViewerDialog(all_cl, detected_loops, self)
+            self.dialog_loop.show()
 
             # =============================================================
             # 보고서
@@ -644,6 +791,7 @@ class UltimateShipAnalyzer(QMainWindow):
             res += f"  157  (paired)  : {len(cl157)}\n"
             res += f"  Bridges        : {bc} pairs\n"
             res += f"Final Nodes      : {len(self.nodes)}\n"
+            res += f"Detected Cells   : {len(self.mesh_cells)} (Closed Loops)\n"
 
             self.base_report = res; self.result_box.setText(res)
             self.is_calculated = True; self.btn_eval.setEnabled(True)
