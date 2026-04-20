@@ -16,7 +16,7 @@ from matplotlib.ticker import FuncFormatter
 import matplotlib.patches as patches
 
 from shapely.geometry import LineString, Polygon, Point, box
-from shapely.ops import unary_union, polygonize, split, nearest_points, snap, linemerge
+from shapely.ops import unary_union, polygonize, split, nearest_points, snap
 import shapely.affinity as affinity
 from shapely.strtree import STRtree
 from shapely.prepared import prep
@@ -34,6 +34,56 @@ rcParams['font.family'] = 'Malgun Gothic'
 rcParams['axes.unicode_minus'] = False
 
 
+class PairViewerDialog(QDialog):
+    def __init__(self, raw_157, raw_1102, pairs_157, pairs_1102, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("디버깅: 짝짓기(Pair Matching) 결과 확인")
+        self.resize(1000, 700)
+        layout = QVBoxLayout(self)
+
+        lbl = QLabel("<b>[시각화 가이드]</b><br>"
+                     "회색 얇은 선: 필터링 완료된 원본 후보 선분들<br>"
+                     "<b>색상 선:</b> 서로 짝(Pair)으로 매칭된 두 선분 (짧은 선은 굵게, 긴 선은 얇게 표시)<br>"
+                     "검은 점선: 매칭된 두 선분의 중심점을 이은 가이드라인")
+        layout.addWidget(lbl)
+
+        self.fig = Figure()
+        canvas = FigureCanvas(self.fig)
+        toolbar = NavigationToolbar(canvas, self)
+        layout.addWidget(toolbar)
+        layout.addWidget(canvas, stretch=1)
+
+        btn = QPushButton("닫기")
+        btn.setFixedHeight(40)
+        btn.setStyleSheet("background-color: #27AE60; color: white; font-weight: bold; font-size: 14px;")
+        btn.clicked.connect(self.close)
+        layout.addWidget(btn)
+
+        ax = self.fig.add_subplot(111)
+        ax.set_aspect('equal')
+        ax.grid(True, linestyle=':', alpha=0.6)
+
+        for l in raw_157: ax.plot(*l.xy, color='lightgray', linewidth=1.5, alpha=0.5)
+        for l in raw_1102: ax.plot(*l.xy, color='lightgray', linewidth=1.5, alpha=0.5)
+
+        all_pairs = pairs_157 + pairs_1102
+        cmap = matplotlib.colormaps.get_cmap('tab20')
+        
+        for idx, (short_line, long_line, ov, dist) in enumerate(all_pairs):
+            color = cmap(idx % 20)
+            ax.plot(*short_line.xy, color=color, linewidth=3.5, alpha=0.9)
+            ax.plot(*long_line.xy, color=color, linewidth=1.5, alpha=0.7)
+            sx, sy = short_line.centroid.xy
+            lx, ly = long_line.centroid.xy
+            ax.plot([sx[0], lx[0]], [sy[0], ly[0]], color='black', linestyle=':', linewidth=1.2, alpha=0.6)
+
+        canvas.draw()
+
+    def closeEvent(self, event: QCloseEvent):
+        plt.close(self.fig)
+        super().closeEvent(event)
+
+
 class CenterlineViewerDialog(QDialog):
     def __init__(self, raw_157, raw_1102, centerlines, nodes, parent=None):
         super().__init__(parent)
@@ -42,7 +92,7 @@ class CenterlineViewerDialog(QDialog):
         layout = QVBoxLayout(self)
         lbl = QLabel("<b>[시각화 가이드]</b><br>"
                      "회색: 필터링된 원본 / 청록: 157 / 주황: 1102 / 분홍: 1999 / 녹색: 브릿지<br>"
-                     "<b><font color='red'>빨간 점: 자동 Noding된 최종 끝점</font></b>")
+                     "<b><font color='red'>빨간 점: 교차점 기반 최종 노드</font></b>")
         layout.addWidget(lbl)
         
         self.fig = Figure()
@@ -450,8 +500,11 @@ class UltimateShipAnalyzer(QMainWindow):
             cutters = [LineString([tuple(np.array(c.coords[0])-20), tuple(np.array(c.coords[-1])+20)]) for c in self.lines_minus1204]
             sr = split(m1999, unary_union(cutters)) if cutters else m1999
             pieces = list(sr.geoms) if hasattr(sr, 'geoms') else [sr]
+            
+            # 1999 외판은 좌현(Port) 선분만 추출 (나중에 거울 복사됨)
             self.left_1999_segments = sorted([g for g in pieces if g.centroid.x <= 0.1 and g.length > 0.1],
                                key=lambda s: (-round(s.centroid.y, 2), s.centroid.x))
+            # 1102와 157은 원본 그대로 모두 가져옵니다 (대칭 복사 안 함)
             self.lines_1102_raw = [shift(ls) for ls in tl["-1102"]]
             self.lines_157 = [shift(ls) for ls in tl["157"]]
             self.refresh_ui()
@@ -471,9 +524,6 @@ class UltimateShipAnalyzer(QMainWindow):
         progress.setAutoClose(False); progress.show()
         QApplication.processEvents()
 
-        # =================================================================
-        # 헬퍼 함수
-        # =================================================================
         def filter_short(lines, ml=100.0):
             return [l for l in lines if l.length >= ml]
 
@@ -619,12 +669,13 @@ class UltimateShipAnalyzer(QMainWindow):
                             if 1e-3 < dd < bd: bd = dd; bp = (pt.x, pt.y)
                     
                     if bp:
-                        # [안정성 패치] 확실하게 십자 교차를 보장하기 위해 1.0mm 오버슈트
-                        overshoot = 0.1
+                        # [핵심 1] 확실한 교차를 위해 안전한 1.0mm 오버슈트 적용
+                        overshoot = 1.0
                         bp_overshot = (bp[0] + d[0] * overshoot, bp[1] + d[1] * overshoot)
                         
                         if ei == 0: coords[0] = bp_overshot
                         else: coords[-1] = bp_overshot
+                        
                         extended_pts.append(np.array(bp_overshot))
                         
                 result.append({'line': LineString(coords), 'thickness': cl['thickness'],
@@ -698,6 +749,53 @@ class UltimateShipAnalyzer(QMainWindow):
                 if idx not in merged: nl.append(cl)
             return nl
 
+        def split_all_lines_at_intersections(centerlines):
+            all_line_geoms = [cl['line'] for cl in centerlines]
+            intersection_points = []
+            for i in range(len(all_line_geoms)):
+                for j in range(i + 1, len(all_line_geoms)):
+                    try:
+                        inter = all_line_geoms[i].intersection(all_line_geoms[j])
+                        if inter.is_empty: continue
+                        if inter.geom_type == 'Point':
+                            intersection_points.append(inter)
+                        elif inter.geom_type == 'MultiPoint':
+                            intersection_points.extend(inter.geoms)
+                        elif inter.geom_type == 'GeometryCollection':
+                            for geom in inter.geoms:
+                                if geom.geom_type == 'Point':
+                                    intersection_points.append(geom)
+                    except: pass
+            for g in all_line_geoms:
+                intersection_points.append(Point(g.coords[0]))
+                intersection_points.append(Point(g.coords[-1]))
+            if not intersection_points:
+                return centerlines
+            unique_points = []
+            for pt in intersection_points:
+                if not unique_points or min(pt.distance(upt) for upt in unique_points) > 1e-3:
+                    unique_points.append(pt)
+            splitter = unary_union(unique_points)
+            new_centerlines = []
+            
+            for cl in centerlines:
+                line = cl['line']
+                try:
+                    snapped_line = snap(line, splitter, 0.05)
+                    res = split(snapped_line, splitter)
+                    geoms = list(res.geoms) if hasattr(res, 'geoms') else [res]
+                    for geom in geoms:
+                        # [핵심 3] 짧은 선분 삭제 로직(if geom.length > 0.15) 완전 폐기!
+                        # 진짜 벽의 미세 파편이 잘려나가는 구멍(Micro-gap) 현상 원천 차단.
+                        # 튀어나온 오버슈트 꼬리는 나중에 polygonize가 수학적으로 자동 무시함.
+                        new_centerlines.append({
+                            'line': geom, 'thickness': cl['thickness'],
+                            'type': cl.get('type', 'internal')
+                        })
+                except:
+                    new_centerlines.append(cl)
+            return new_centerlines
+
         try:
             # =============================================================
             # 0. 이너시아 계산
@@ -741,19 +839,22 @@ class UltimateShipAnalyzer(QMainWindow):
             self.raw_shear = float(self.txt_shear_v.text())
 
             # =============================================================
-            # 1D 추출 파이프라인
+            # 1D 추출 파이프라인 (대칭 복사 제거, 도면 원본 유지)
             # =============================================================
             progress.setLabelText("Step 1: Loading layers...")
             QApplication.processEvents()
+            
             l1999f = []
             for i, ls in enumerate(l1999s):
                 try: ta = float(self.shell_thickness_inputs[i].text())
                 except: ta = 10.0
                 l1999f.append({'line': ls, 'thickness': ta, 'type': '1999'})
+                # 외판(1999) 껍데기는 온전한 배 모양을 위해 양쪽 다 덮음
                 l1999f.append({'line': affinity.scale(ls, xfact=-1.0, origin=(0,0)), 'thickness': ta, 'type': '1999'})
 
             progress.setLabelText("Step 2: Pre-filtering...")
             if progress.wasCanceled(): raise UserWarning("Operation canceled.")
+            # 원본 c1102와 c157을 그대로 사용합니다 (대칭 복사 안 함)
             f1102 = remove_overlapping(filter_short(c1102, 100.0))
             f157 = remove_overlapping(filter_short(c157, 100.0))
 
@@ -774,6 +875,9 @@ class UltimateShipAnalyzer(QMainWindow):
             QApplication.processEvents()
             p1102 = match_pairs(h1102, max_dist=100.0, angle_tol=20.0, overlap_tolerance=5.0)
             p157 = match_pairs(s157, max_dist=100.0, angle_tol=20.0, overlap_tolerance=5.0)
+
+            self.dialog_pair = PairViewerDialog(s157, h1102, p157, p1102, self)
+            self.dialog_pair.show()
 
             progress.setLabelText("Step 6: Creating centerlines (unclamped projection)...")
             cl1102 = create_centerlines(p1102)
@@ -799,46 +903,37 @@ class UltimateShipAnalyzer(QMainWindow):
                 if len(nl) == prev: break
                 prev = len(nl); all_cl = nl
 
-            # =============================================================
-            # [삭제됨] 수동 분할(split_all_lines...) 및 병합(linemerge) 완전 제거
-            # =============================================================
+            # [핵심 2] 강제 분할로 모든 교차점 Node 생성 보장
+            all_cl = split_all_lines_at_intersections(all_cl)
+
+            raw_endpoints_set = set()
+            for cl in all_cl:
+                coords = list(cl['line'].coords)
+                raw_endpoints_set.add(tuple(coords[0]))
+                raw_endpoints_set.add(tuple(coords[-1]))
+                
+            extracted_nodes = list(raw_endpoints_set)
 
             # =============================================================
-            # 폐단면(Closed Loop/Cell) 인식 (위상 수학적 완벽 Noding 적용)
+            # 폐단면(Closed Loop/Cell) 인식 및 시각화
             # =============================================================
             progress.setLabelText("Step 10: Detecting closed loops (Cells)...")
             QApplication.processEvents()
             
             line_geoms = [cl['line'] for cl in all_cl]
+            planarized_network = unary_union(line_geoms)
             
-            # [해결 핵심] 모든 선분을 모아 엔진 고유의 완벽한 분할(Noding) 기능 사용
-            noded_network = unary_union(line_geoms)
-            
-            # Shapely 2.0+ 의 경우, 0.01mm의 미세 오차를 강제 스냅(용접)하여 
-            # 공통 벽에서 발생하는 원자 단위의 누수 현상 원천 차단
             try:
                 from shapely import set_precision
-                noded_network = set_precision(noded_network, grid_size=0.01)
+                planarized_network = set_precision(planarized_network, grid_size=0.01)
             except ImportError:
                 pass
                 
-            # polygonize는 닫히지 않고 튀어나온 1.0mm 오버슈트 꼬리들을
-            # 알아서 무시하고 깨끗한 다중 폐단면만 추출합니다.
-            detected_loops = list(polygonize(noded_network))
+            detected_loops = list(polygonize(planarized_network))
             self.mesh_cells = detected_loops
             
             self.dialog_loop = LoopViewerDialog(all_cl, detected_loops, self)
             self.dialog_loop.show()
-
-            # 시각화용 끝점 추출 (noded_network에서 직접 추출)
-            raw_endpoints_set = set()
-            if hasattr(noded_network, 'geoms'):
-                for line in noded_network.geoms:
-                    if line.geom_type == 'LineString':
-                        coords = list(line.coords)
-                        raw_endpoints_set.add(tuple(coords[0]))
-                        raw_endpoints_set.add(tuple(coords[-1]))
-            extracted_nodes = list(raw_endpoints_set)
 
             self.dialog_cl = CenterlineViewerDialog(f157, f1102, all_cl, extracted_nodes, self)
             self.dialog_cl.show()
