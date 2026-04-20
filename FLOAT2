@@ -42,7 +42,7 @@ class CenterlineViewerDialog(QDialog):
         layout = QVBoxLayout(self)
         lbl = QLabel("<b>[시각화 가이드]</b><br>"
                      "회색: 필터링된 원본 / 청록: 157 / 주황: 1102 / 분홍: 1999 / 녹색: 브릿지<br>"
-                     "<b><font color='red'>빨간 점: 최종 노드</font></b>")
+                     "<b><font color='red'>빨간 점: 교차점 기반 최종 노드 (오버슈트 꼬리 제거됨)</font></b>")
         layout.addWidget(lbl)
         fig = Figure()
         canvas = FigureCanvas(fig)
@@ -488,18 +488,15 @@ class UltimateShipAnalyzer(QMainWindow):
                     mj = meta[j]
                     ad = min(abs(mi['ang']-mj['ang']), 180-abs(mi['ang']-mj['ang']))
                     if ad > angle_tol: continue
-                    # 짧은 선 중심에서 긴 선까지 수선의 발
                     ap = mi['mid'] - mj['ps']
                     t_mid = np.dot(ap, mj['unit'])
                     proj = mj['ps'] + np.clip(t_mid, 0, mj['ln']) * mj['unit']
                     d = np.linalg.norm(mi['mid'] - proj)
                     if d > max_dist: continue
-                    # 투영 구간
                     t1 = np.dot(mi['ps'] - mj['ps'], mj['unit'])
                     t2 = np.dot(mi['pe'] - mj['ps'], mj['unit'])
                     ov_s, ov_e = max(0, min(t1,t2)), min(mj['ln'], max(t1,t2))
                     if (ov_e - ov_s) < mi['ln'] * 0.5: continue
-                    # 계단부 겹침 허용
                     is_blocked = False
                     for (us, ue) in used[j]:
                         overlap_len = min(ov_e, ue) - max(ov_s, us)
@@ -523,21 +520,20 @@ class UltimateShipAnalyzer(QMainWindow):
                 ll = np.linalg.norm(vl)
                 if ll < 1e-6: continue
                 vl_u = vl / ll
-
-                # 5개 보간점에서 중심선 생성
                 mids = []
                 for frac in np.linspace(0, 1, 5):
                     pt_s = ps1 + (ps2 - ps1) * frac
                     t = np.dot(pt_s - pl1, vl_u)
                     pt_l = pl1 + t * vl_u  # clamping 없음
                     mids.append(tuple((pt_s + pt_l) / 2.0))
-
                 thickness = round(dist * 2) / 2.0
                 result.append({'line': LineString(mids), 'thickness': thickness})
             return result
 
         def raycast_extend(centerlines, max_dist=50.0):
-            extended_pts = set(); result = []
+            # [수정] 정확한 좌표 관리를 위해 list of numpy array로 변경
+            extended_pts = [] 
+            result = []
             for i, cl in enumerate(centerlines):
                 coords = list(cl['line'].coords)
                 if len(coords) < 2: result.append(cl); continue
@@ -566,14 +562,15 @@ class UltimateShipAnalyzer(QMainWindow):
                             if 1e-3 < dd < bd: bd = dd; bp = (pt.x, pt.y)
                     
                     if bp:
-                        # [핵심 수정] T-Junction 누수 방지를 위한 1.0mm 고의 오버슈트(Overshoot) 적용
-                        # 이후 진행되는 unary_union이 교차점(Crossing)을 완벽한 노드로 분할하도록 강제함
-                        overshoot = 1.0
+                        # [조건 1,2,3 반영] 0.1mm 오버슈트
+                        overshoot = 0.1
                         bp_overshot = (bp[0] + d[0] * overshoot, bp[1] + d[1] * overshoot)
                         
                         if ei == 0: coords[0] = bp_overshot
                         else: coords[-1] = bp_overshot
-                        extended_pts.add((round(bp[0], 2), round(bp[1], 2)))
+                        
+                        # [수정] 정밀 비교를 위해 배열을 그대로 저장
+                        extended_pts.append(np.array(bp_overshot))
                         
                 result.append({'line': LineString(coords), 'thickness': cl['thickness'],
                                'type': cl.get('type', 'internal')})
@@ -593,9 +590,17 @@ class UltimateShipAnalyzer(QMainWindow):
             for key, conns in ep_map.items():
                 if len(conns) != 1: continue
                 info = conns[0]
-                pk = (round(info['pt'][0], 2), round(info['pt'][1], 2))
-                if pk in extended_pts: continue
+                
+                # [핵심 수정] 오버슈트 지점은 닫힌 지점(Closed)으로 간주하여 브릿징(병합) 원천 차단
+                is_extended = False
+                for ext_pt in extended_pts:
+                    if np.linalg.norm(info['pt'] - ext_pt) < 1.0:
+                        is_extended = True
+                        break
+                if is_extended: continue
+                
                 open_eps.append(info)
+            
             matched = set(); bridges = []
             for i, e1 in enumerate(open_eps):
                 if i in matched: continue
@@ -639,6 +644,53 @@ class UltimateShipAnalyzer(QMainWindow):
             for idx, cl in enumerate(centerlines):
                 if idx not in merged: nl.append(cl)
             return nl
+
+        def split_all_lines_at_intersections(centerlines):
+            all_line_geoms = [cl['line'] for cl in centerlines]
+            intersection_points = []
+            for i in range(len(all_line_geoms)):
+                for j in range(i + 1, len(all_line_geoms)):
+                    try:
+                        inter = all_line_geoms[i].intersection(all_line_geoms[j])
+                        if inter.is_empty: continue
+                        if inter.geom_type == 'Point':
+                            intersection_points.append(inter)
+                        elif inter.geom_type == 'MultiPoint':
+                            intersection_points.extend(inter.geoms)
+                        elif inter.geom_type == 'GeometryCollection':
+                            for geom in inter.geoms:
+                                if geom.geom_type == 'Point':
+                                    intersection_points.append(geom)
+                    except: pass
+            for g in all_line_geoms:
+                intersection_points.append(Point(g.coords[0]))
+                intersection_points.append(Point(g.coords[-1]))
+            if not intersection_points:
+                return centerlines
+            unique_points = []
+            for pt in intersection_points:
+                if not unique_points or min(pt.distance(upt) for upt in unique_points) > 1e-3:
+                    unique_points.append(pt)
+            splitter = unary_union(unique_points)
+            new_centerlines = []
+            
+            for cl in centerlines:
+                line = cl['line']
+                try:
+                    # [핵심 수정] 스냅 범위를 극단적으로 낮춰 0.1mm 오버슈트 꼬리가 뭉개지지 않게 방어
+                    snapped_line = snap(line, splitter, 0.05)
+                    res = split(snapped_line, splitter)
+                    geoms = list(res.geoms) if hasattr(res, 'geoms') else [res]
+                    for geom in geoms:
+                        # [핵심 수정] 0.1mm 꼬리 부분을 버리고 진짜 교차점(Node)에서 선이 끝맺도록 함
+                        if geom.length > 0.15:
+                            new_centerlines.append({
+                                'line': geom, 'thickness': cl['thickness'],
+                                'type': cl.get('type', 'internal')
+                            })
+                except:
+                    new_centerlines.append(cl)
+            return new_centerlines
 
         try:
             # =============================================================
@@ -729,18 +781,43 @@ class UltimateShipAnalyzer(QMainWindow):
                 if len(nl) == prev: break
                 prev = len(nl); all_cl = nl
 
-            node_dict = {}
+            # 스플릿 실행하여 교차점에서 확실하게 분할 및 오버슈트 꼬리 제거
+            all_cl = split_all_lines_at_intersections(all_cl)
+
+            lines_by_props = defaultdict(list)
+            for cl in all_cl:
+                prop_key = (cl.get('type'), cl.get('thickness'))
+                lines_by_props[prop_key].append(cl['line'])
+                
+            merged_centerlines = []
+            for prop_key, geoms in lines_by_props.items():
+                if not geoms: continue
+                merged = linemerge(geoms)
+                m_list = list(merged.geoms) if hasattr(merged, 'geoms') else [merged]
+                for m in m_list:
+                    if m.geom_type == 'LineString':
+                        merged_centerlines.append({
+                            'line': m, 'type': prop_key[0], 'thickness': prop_key[1]
+                        })
+                    elif m.geom_type == 'MultiLineString':
+                        for single_line in m.geoms:
+                            merged_centerlines.append({
+                                'line': single_line, 'type': prop_key[0], 'thickness': prop_key[1]
+                            })
+            all_cl = merged_centerlines
+
+            raw_endpoints_set = set()
             for cl in all_cl:
                 coords = list(cl['line'].coords)
-                for pt in [coords[0], coords[-1]]:
-                    key = (round(pt[0], 1), round(pt[1], 1))
-                    if key not in node_dict: node_dict[key] = pt
-            nodes = list(node_dict.values())
+                raw_endpoints_set.add(tuple(coords[0]))
+                raw_endpoints_set.add(tuple(coords[-1]))
+                
+            extracted_nodes = list(raw_endpoints_set)
 
-            self.dialog_cl = CenterlineViewerDialog(f157, f1102, all_cl, nodes, self)
+            self.dialog_cl = CenterlineViewerDialog(f157, f1102, all_cl, extracted_nodes, self)
             self.dialog_cl.show()
             self.centerlines = all_cl
-            self.nodes = nodes
+            self.nodes = extracted_nodes
             self.single_nodes = []
             self.merged_nodes = []
             self.topological_edges = []
@@ -751,11 +828,8 @@ class UltimateShipAnalyzer(QMainWindow):
             progress.setLabelText("Step 10: Detecting closed loops (Cells)...")
             line_geoms = [cl['line'] for cl in all_cl]
             
-            # [핵심 보완] 미세 부동소수점 오차 방지
-            # 오버슈트(Overshoot)가 적용된 선분들을 교차점 기준으로 완벽하게 잘라(Node) 평면화
             planarized_network = unary_union(line_geoms)
             
-            # 갇힌 다각형 구역 추출
             detected_loops = list(polygonize(planarized_network))
             self.mesh_cells = detected_loops
             
