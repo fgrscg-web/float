@@ -26,7 +26,7 @@ from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                                QPushButton, QLabel, QTextEdit, QFileDialog, QLineEdit,
                                QHBoxLayout, QScrollArea, QFrame, QSplitter, QComboBox,
                                QInputDialog, QMessageBox, QProgressDialog, QDialog)
-from PySide6.QtGui import QTextCursor, QIcon
+from PySide6.QtGui import QTextCursor, QIcon, QCloseEvent
 from PySide6.QtCore import Qt
 
 matplotlib.use('QtAgg')
@@ -42,21 +42,25 @@ class CenterlineViewerDialog(QDialog):
         layout = QVBoxLayout(self)
         lbl = QLabel("<b>[시각화 가이드]</b><br>"
                      "회색: 필터링된 원본 / 청록: 157 / 주황: 1102 / 분홍: 1999 / 녹색: 브릿지<br>"
-                     "<b><font color='red'>빨간 점: 교차점 기반 최종 노드 (오버슈트 꼬리 제거됨)</font></b>")
+                     "<b><font color='red'>빨간 점: 자동 Noding된 최종 끝점</font></b>")
         layout.addWidget(lbl)
-        fig = Figure()
-        canvas = FigureCanvas(fig)
+        
+        self.fig = Figure()
+        canvas = FigureCanvas(self.fig)
         toolbar = NavigationToolbar(canvas, self)
         layout.addWidget(toolbar)
         layout.addWidget(canvas, stretch=1)
+        
         btn = QPushButton("닫기")
         btn.setFixedHeight(40)
         btn.setStyleSheet("background-color: #5D6D7E; color: white; font-weight: bold; font-size: 14px;")
         btn.clicked.connect(self.close)
         layout.addWidget(btn)
-        ax = fig.add_subplot(111)
+        
+        ax = self.fig.add_subplot(111)
         ax.set_aspect('equal')
         ax.grid(True, linestyle=':', alpha=0.6)
+        
         for l in raw_157: ax.plot(*l.xy, color='gray', linewidth=1.5, alpha=0.3)
         for l in raw_1102: ax.plot(*l.xy, color='gray', linewidth=1.5, alpha=0.3)
         for cl in centerlines:
@@ -81,6 +85,10 @@ class CenterlineViewerDialog(QDialog):
             ax.plot([p[0] for p in nodes], [p[1] for p in nodes], 'ro', markersize=5, zorder=10)
         canvas.draw()
 
+    def closeEvent(self, event: QCloseEvent):
+        plt.close(self.fig)
+        super().closeEvent(event)
+
 
 class LoopViewerDialog(QDialog):
     def __init__(self, centerlines, loops, parent=None):
@@ -94,8 +102,8 @@ class LoopViewerDialog(QDialog):
                      "색상 영역: 독립된 폐단면(Cell)으로 인식된 루프들")
         layout.addWidget(lbl)
 
-        fig = Figure()
-        canvas = FigureCanvas(fig)
+        self.fig = Figure()
+        canvas = FigureCanvas(self.fig)
         toolbar = NavigationToolbar(canvas, self)
         layout.addWidget(toolbar)
         layout.addWidget(canvas, stretch=1)
@@ -106,7 +114,7 @@ class LoopViewerDialog(QDialog):
         btn.clicked.connect(self.close)
         layout.addWidget(btn)
 
-        ax = fig.add_subplot(111)
+        ax = self.fig.add_subplot(111)
         ax.set_aspect('equal')
         ax.grid(True, linestyle=':', alpha=0.6)
 
@@ -125,6 +133,10 @@ class LoopViewerDialog(QDialog):
 
         canvas.draw()
 
+    def closeEvent(self, event: QCloseEvent):
+        plt.close(self.fig)
+        super().closeEvent(event)
+
 
 class UltimateShipAnalyzer(QMainWindow):
     def __init__(self):
@@ -133,6 +145,7 @@ class UltimateShipAnalyzer(QMainWindow):
         self.resize(2000, 1200)
         self.saved_frames_data = []
         self.current_dxf_path = ""
+        self.is_processing = False
         self.reset_analysis_data()
         self.init_ui()
 
@@ -348,6 +361,44 @@ class UltimateShipAnalyzer(QMainWindow):
                 if 0.1 < g <= threshold_gap: bridges.append(LineString([tuple(pe), tuple(pn)]))
         return lines + bridges
 
+    def heal_1999_collinear(self, line_infos, threshold_gap=500.0):
+        if not line_infos: return []
+        bridges = []
+        groups = {}
+        for info in line_infos:
+            l = info['line']
+            c = list(l.coords)
+            p1, p2 = np.array(c[0]), np.array(c[-1])
+            v = p2 - p1
+            L = np.linalg.norm(v)
+            if L < 1e-6: continue
+            a = np.degrees(np.arctan2(v[1], v[0])) % 180.0
+            ak = round(a, 0)
+            th = np.radians(ak)
+            rho = round((-p1[0]*np.sin(th) + p1[1]*np.cos(th))/10.0)*10.0
+            key = (ak, rho)
+            if key not in groups: groups[key] = []
+            groups[key].append((info, p1, p2))
+            
+        for (ak, _), grp in groups.items():
+            if len(grp) < 2: continue
+            dv = np.array([np.cos(np.radians(ak)), np.sin(np.radians(ak))])
+            segs = sorted([(np.dot(p1, dv), np.dot(p2, dv), p1, p2, info) for info, p1, p2 in grp],
+                          key=lambda x: min(x[0], x[1]))
+            for i in range(len(segs)-1):
+                pe = segs[i][2] if segs[i][0] > segs[i][1] else segs[i][3]
+                pn = segs[i+1][3] if segs[i+1][0] > segs[i+1][1] else segs[i+1][2]
+                g = np.linalg.norm(pn - pe)
+                if 0.1 < g <= threshold_gap:
+                    thk = (segs[i][4]['thickness'] + segs[i+1][4]['thickness']) / 2.0
+                    bridges.append({
+                        'line': LineString([tuple(pe), tuple(pn)]), 
+                        'thickness': thk, 
+                        'type': '1999', 
+                        'is_bridge': True
+                    })
+        return line_infos + bridges
+
     def generate_outward_thickness(self, line, thickness):
         try:
             coords = list(line.coords)
@@ -364,6 +415,8 @@ class UltimateShipAnalyzer(QMainWindow):
         except: return line.buffer(thickness/2.0)
 
     def load_and_process_dxf(self):
+        if self.is_processing: return
+        
         fname, _ = QFileDialog.getOpenFileName(self, 'Select DXF File', '', 'DXF files (*.dxf)')
         if not fname: return
         self.reset_analysis_data()
@@ -407,6 +460,11 @@ class UltimateShipAnalyzer(QMainWindow):
             self.result_box.setText(f"❌ Load Error:\n{traceback.format_exc()}")
 
     def calculate_total_inertia(self):
+        if self.is_processing: return
+        self.is_processing = True
+        self.btn_calc.setEnabled(False)
+        self.btn_load.setEnabled(False)
+
         progress = QProgressDialog("Processing...", "Cancel", 0, 100, self)
         progress.setWindowTitle("Processing")
         progress.setWindowModality(Qt.WindowModal)
@@ -524,14 +582,13 @@ class UltimateShipAnalyzer(QMainWindow):
                 for frac in np.linspace(0, 1, 5):
                     pt_s = ps1 + (ps2 - ps1) * frac
                     t = np.dot(pt_s - pl1, vl_u)
-                    pt_l = pl1 + t * vl_u  # clamping 없음
+                    pt_l = pl1 + t * vl_u  
                     mids.append(tuple((pt_s + pt_l) / 2.0))
                 thickness = round(dist * 2) / 2.0
                 result.append({'line': LineString(mids), 'thickness': thickness})
             return result
 
-        def raycast_extend(centerlines, max_dist=50.0):
-            # [수정] 정확한 좌표 관리를 위해 list of numpy array로 변경
+        def raycast_extend(centerlines, max_dist=100.0):
             extended_pts = [] 
             result = []
             for i, cl in enumerate(centerlines):
@@ -562,14 +619,12 @@ class UltimateShipAnalyzer(QMainWindow):
                             if 1e-3 < dd < bd: bd = dd; bp = (pt.x, pt.y)
                     
                     if bp:
-                        # [조건 1,2,3 반영] 0.1mm 오버슈트
+                        # [안정성 패치] 확실하게 십자 교차를 보장하기 위해 1.0mm 오버슈트
                         overshoot = 0.1
                         bp_overshot = (bp[0] + d[0] * overshoot, bp[1] + d[1] * overshoot)
                         
                         if ei == 0: coords[0] = bp_overshot
                         else: coords[-1] = bp_overshot
-                        
-                        # [수정] 정밀 비교를 위해 배열을 그대로 저장
                         extended_pts.append(np.array(bp_overshot))
                         
                 result.append({'line': LineString(coords), 'thickness': cl['thickness'],
@@ -591,14 +646,12 @@ class UltimateShipAnalyzer(QMainWindow):
                 if len(conns) != 1: continue
                 info = conns[0]
                 
-                # [핵심 수정] 오버슈트 지점은 닫힌 지점(Closed)으로 간주하여 브릿징(병합) 원천 차단
                 is_extended = False
                 for ext_pt in extended_pts:
                     if np.linalg.norm(info['pt'] - ext_pt) < 1.0:
                         is_extended = True
                         break
                 if is_extended: continue
-                
                 open_eps.append(info)
             
             matched = set(); bridges = []
@@ -645,65 +698,19 @@ class UltimateShipAnalyzer(QMainWindow):
                 if idx not in merged: nl.append(cl)
             return nl
 
-        def split_all_lines_at_intersections(centerlines):
-            all_line_geoms = [cl['line'] for cl in centerlines]
-            intersection_points = []
-            for i in range(len(all_line_geoms)):
-                for j in range(i + 1, len(all_line_geoms)):
-                    try:
-                        inter = all_line_geoms[i].intersection(all_line_geoms[j])
-                        if inter.is_empty: continue
-                        if inter.geom_type == 'Point':
-                            intersection_points.append(inter)
-                        elif inter.geom_type == 'MultiPoint':
-                            intersection_points.extend(inter.geoms)
-                        elif inter.geom_type == 'GeometryCollection':
-                            for geom in inter.geoms:
-                                if geom.geom_type == 'Point':
-                                    intersection_points.append(geom)
-                    except: pass
-            for g in all_line_geoms:
-                intersection_points.append(Point(g.coords[0]))
-                intersection_points.append(Point(g.coords[-1]))
-            if not intersection_points:
-                return centerlines
-            unique_points = []
-            for pt in intersection_points:
-                if not unique_points or min(pt.distance(upt) for upt in unique_points) > 1e-3:
-                    unique_points.append(pt)
-            splitter = unary_union(unique_points)
-            new_centerlines = []
-            
-            for cl in centerlines:
-                line = cl['line']
-                try:
-                    # [핵심 수정] 스냅 범위를 극단적으로 낮춰 0.1mm 오버슈트 꼬리가 뭉개지지 않게 방어
-                    snapped_line = snap(line, splitter, 0.05)
-                    res = split(snapped_line, splitter)
-                    geoms = list(res.geoms) if hasattr(res, 'geoms') else [res]
-                    for geom in geoms:
-                        # [핵심 수정] 0.1mm 꼬리 부분을 버리고 진짜 교차점(Node)에서 선이 끝맺도록 함
-                        if geom.length > 0.15:
-                            new_centerlines.append({
-                                'line': geom, 'thickness': cl['thickness'],
-                                'type': cl.get('type', 'internal')
-                            })
-                except:
-                    new_centerlines.append(cl)
-            return new_centerlines
-
         try:
             # =============================================================
             # 0. 이너시아 계산
             # =============================================================
             temp_left, temp_right = [], []
             for i, ls in enumerate(self.left_1999_segments):
-                if progress.wasCanceled(): return
+                if progress.wasCanceled(): raise UserWarning("User canceled the operation.")
                 if i % 2 == 0: QApplication.processEvents()
                 try: t = float(self.shell_thickness_inputs[i].text())
                 except: t = 10.0
                 lp = self.generate_outward_thickness(ls, t)
                 temp_left.append(lp); temp_right.append(affinity.scale(lp, xfact=-1.0, origin=(0,0)))
+            
             QApplication.processEvents()
             shells = temp_left + temp_right
             if shells:
@@ -737,6 +744,7 @@ class UltimateShipAnalyzer(QMainWindow):
             # 1D 추출 파이프라인
             # =============================================================
             progress.setLabelText("Step 1: Loading layers...")
+            QApplication.processEvents()
             l1999f = []
             for i, ls in enumerate(l1999s):
                 try: ta = float(self.shell_thickness_inputs[i].text())
@@ -745,11 +753,17 @@ class UltimateShipAnalyzer(QMainWindow):
                 l1999f.append({'line': affinity.scale(ls, xfact=-1.0, origin=(0,0)), 'thickness': ta, 'type': '1999'})
 
             progress.setLabelText("Step 2: Pre-filtering...")
+            if progress.wasCanceled(): raise UserWarning("Operation canceled.")
             f1102 = remove_overlapping(filter_short(c1102, 100.0))
             f157 = remove_overlapping(filter_short(c157, 100.0))
 
             progress.setLabelText("Step 3: Healing -1102...")
+            if progress.wasCanceled(): raise UserWarning("Operation canceled.")
             h1102 = self.heal_1102_collinear(f1102, threshold_gap=150)
+
+            progress.setLabelText("Step 3.5: Healing 1999...")
+            if progress.wasCanceled(): raise UserWarning("Operation canceled.")
+            l1999f = self.heal_1999_collinear(l1999f, threshold_gap=500.0)
 
             progress.setLabelText("Step 4: Splitting 157 at slope changes...")
             s157 = []
@@ -757,6 +771,7 @@ class UltimateShipAnalyzer(QMainWindow):
             s157 = [s for s in s157 if s.length >= 30.0]
 
             progress.setLabelText("Step 5: Pair matching (with 5mm step tolerance)...")
+            QApplication.processEvents()
             p1102 = match_pairs(h1102, max_dist=100.0, angle_tol=20.0, overlap_tolerance=5.0)
             p157 = match_pairs(s157, max_dist=100.0, angle_tol=20.0, overlap_tolerance=5.0)
 
@@ -765,13 +780,16 @@ class UltimateShipAnalyzer(QMainWindow):
             for cl in cl1102: cl['type'] = '1102'
             cl157 = create_centerlines(p157)
             for cl in cl157: cl['type'] = '157'
-            cl1999 = [l for l in l1999f if l['line'].length > 100.0]
+            
+            cl1999 = [l for l in l1999f if l['line'].length > 100.0 or l.get('is_bridge', False)]
             all_cl = cl1999 + cl1102 + cl157
 
-            progress.setLabelText("Step 7: Ray-casting (≤50mm)...")
-            all_cl, ext_pts = raycast_extend(all_cl, max_dist=50.0)
+            progress.setLabelText("Step 7: Ray-casting (≤100mm)...")
+            if progress.wasCanceled(): raise UserWarning("Operation canceled.")
+            all_cl, ext_pts = raycast_extend(all_cl, max_dist=100.0)
 
             progress.setLabelText("Step 8: Bridging open nodes (≤100mm)...")
+            if progress.wasCanceled(): raise UserWarning("Operation canceled.")
             all_cl, bc = bridge_open_nodes(all_cl, ext_pts, max_gap=100.0)
 
             progress.setLabelText("Step 9: Filtering redundant nodes...")
@@ -781,60 +799,55 @@ class UltimateShipAnalyzer(QMainWindow):
                 if len(nl) == prev: break
                 prev = len(nl); all_cl = nl
 
-            # 스플릿 실행하여 교차점에서 확실하게 분할 및 오버슈트 꼬리 제거
-            all_cl = split_all_lines_at_intersections(all_cl)
+            # =============================================================
+            # [삭제됨] 수동 분할(split_all_lines...) 및 병합(linemerge) 완전 제거
+            # =============================================================
 
-            lines_by_props = defaultdict(list)
-            for cl in all_cl:
-                prop_key = (cl.get('type'), cl.get('thickness'))
-                lines_by_props[prop_key].append(cl['line'])
+            # =============================================================
+            # 폐단면(Closed Loop/Cell) 인식 (위상 수학적 완벽 Noding 적용)
+            # =============================================================
+            progress.setLabelText("Step 10: Detecting closed loops (Cells)...")
+            QApplication.processEvents()
+            
+            line_geoms = [cl['line'] for cl in all_cl]
+            
+            # [해결 핵심] 모든 선분을 모아 엔진 고유의 완벽한 분할(Noding) 기능 사용
+            noded_network = unary_union(line_geoms)
+            
+            # Shapely 2.0+ 의 경우, 0.01mm의 미세 오차를 강제 스냅(용접)하여 
+            # 공통 벽에서 발생하는 원자 단위의 누수 현상 원천 차단
+            try:
+                from shapely import set_precision
+                noded_network = set_precision(noded_network, grid_size=0.01)
+            except ImportError:
+                pass
                 
-            merged_centerlines = []
-            for prop_key, geoms in lines_by_props.items():
-                if not geoms: continue
-                merged = linemerge(geoms)
-                m_list = list(merged.geoms) if hasattr(merged, 'geoms') else [merged]
-                for m in m_list:
-                    if m.geom_type == 'LineString':
-                        merged_centerlines.append({
-                            'line': m, 'type': prop_key[0], 'thickness': prop_key[1]
-                        })
-                    elif m.geom_type == 'MultiLineString':
-                        for single_line in m.geoms:
-                            merged_centerlines.append({
-                                'line': single_line, 'type': prop_key[0], 'thickness': prop_key[1]
-                            })
-            all_cl = merged_centerlines
+            # polygonize는 닫히지 않고 튀어나온 1.0mm 오버슈트 꼬리들을
+            # 알아서 무시하고 깨끗한 다중 폐단면만 추출합니다.
+            detected_loops = list(polygonize(noded_network))
+            self.mesh_cells = detected_loops
+            
+            self.dialog_loop = LoopViewerDialog(all_cl, detected_loops, self)
+            self.dialog_loop.show()
 
+            # 시각화용 끝점 추출 (noded_network에서 직접 추출)
             raw_endpoints_set = set()
-            for cl in all_cl:
-                coords = list(cl['line'].coords)
-                raw_endpoints_set.add(tuple(coords[0]))
-                raw_endpoints_set.add(tuple(coords[-1]))
-                
+            if hasattr(noded_network, 'geoms'):
+                for line in noded_network.geoms:
+                    if line.geom_type == 'LineString':
+                        coords = list(line.coords)
+                        raw_endpoints_set.add(tuple(coords[0]))
+                        raw_endpoints_set.add(tuple(coords[-1]))
             extracted_nodes = list(raw_endpoints_set)
 
             self.dialog_cl = CenterlineViewerDialog(f157, f1102, all_cl, extracted_nodes, self)
             self.dialog_cl.show()
+            
             self.centerlines = all_cl
             self.nodes = extracted_nodes
             self.single_nodes = []
             self.merged_nodes = []
             self.topological_edges = []
-
-            # =============================================================
-            # 폐단면(Closed Loop/Cell) 인식 및 시각화
-            # =============================================================
-            progress.setLabelText("Step 10: Detecting closed loops (Cells)...")
-            line_geoms = [cl['line'] for cl in all_cl]
-            
-            planarized_network = unary_union(line_geoms)
-            
-            detected_loops = list(polygonize(planarized_network))
-            self.mesh_cells = detected_loops
-            
-            self.dialog_loop = LoopViewerDialog(all_cl, detected_loops, self)
-            self.dialog_loop.show()
 
             # =============================================================
             # 보고서
@@ -871,9 +884,17 @@ class UltimateShipAnalyzer(QMainWindow):
             self.is_calculated = True; self.btn_eval.setEnabled(True)
             progress.setLabelText("Rendering..."); progress.setMaximum(0)
             QApplication.processEvents(); self.refresh_ui()
+
+        except UserWarning as uw:
+            self.result_box.setText(f"⚠️ {str(uw)}")
         except Exception as e:
-            self.result_box.setText(f"Error: {e}\n{traceback.format_exc()}")
-        finally: progress.close()
+            self.result_box.setText(f"❌ Calculation Error:\n{str(e)}\n\n{traceback.format_exc()}")
+            QMessageBox.critical(self, "Fatal Error", f"예기치 못한 기하학적 에러가 발생했습니다.\n\n{str(e)}")
+        finally:
+            progress.close()
+            self.is_processing = False
+            self.btn_calc.setEnabled(True)
+            self.btn_load.setEnabled(True)
 
     def evaluate_strength(self):
         if not self.is_calculated: return
