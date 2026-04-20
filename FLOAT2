@@ -575,7 +575,7 @@ class UltimateShipAnalyzer(QMainWindow):
             progress.setLabelText("Step 4: Splitting 157 at slope changes...")
             s157 = []
             for l in f157: s157.extend(split_by_slope(l, at=5.0))
-            s157 = [s for s in s157 if s.length >= 100.0]
+            s157 = [s for s in s157 if s.length >= 30.0]
 
             progress.setLabelText("Step 5: Pair matching (with 5mm step tolerance)...")
             p1102 = match_pairs(f1102, max_dist=100.0, angle_tol=20.0, overlap_tolerance=5.0)
