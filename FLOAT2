@@ -1,86 +1,196 @@
-   def refresh_ui(self):
-        saved = [edit.text() for edit in self.shell_thickness_inputs]
-        self.fig1.clear()
-        self.fig2.clear()
-        ax1, ax2 = self.fig1.add_subplot(111), self.fig2.add_subplot(111)
+    def init_ui(self):
+        main_scroll = QScrollArea()
+        main_scroll.setWidgetResizable(True)
+        main_container = QWidget()
+        main_layout = QHBoxLayout(main_container)
 
-        for i in reversed(range(self.thickness_layout.count())):
-            w = self.thickness_layout.itemAt(i).widget()
-            if w: w.setParent(None)
-        self.shell_thickness_inputs.clear()
+        self.input_style = "background-color: white; color: black; border: 1px solid #ABB2B9; padding: 2px;"
+        self.field_width = 100
 
-        if self.is_calculated:
-            if self.centerlines:
-                for cl in self.centerlines:
-                    lo = cl['line']
-                    x, y = lo.xy
-                    ct = cl.get('type', '')
-                    if ct == '1999':
-                        color = '#FF00FF'
-                    elif ct == '157':
-                        color = '#00FFFF'
-                    elif ct == '1102':
-                        color = '#FFA500'
-                    elif ct == 'stiffener':
-                        color = '#008000'
-                    elif ct == 'bridge':
-                        color = '#00CC00'
-                    else:
-                        color = '#00FF00'
-                    thk = cl.get('thickness', 10.0)
+        control_panel = QWidget()
+        control_panel.setFixedWidth(300)
+        control_panel_layout = QVBoxLayout(control_panel)
+        control_panel_layout.setAlignment(Qt.AlignTop)
 
-                    if thk > 0:
-                        try:
-                            poly = lo.buffer(thk / 2.0, cap_style=2)
-                            if poly.geom_type == 'Polygon':
-                                ax1.fill(*poly.exterior.xy, color=color, alpha=0.3, zorder=9, edgecolor='none')
-                            elif poly.geom_type == 'MultiPolygon':
-                                for p in poly.geoms:
-                                    ax1.fill(*p.exterior.xy, color=color, alpha=0.3, zorder=9, edgecolor='none')
-                        except:
-                            pass
-                    ax1.plot(x, y, color=color, linewidth=2.5, alpha=0.9, zorder=10, linestyle='-')
+        gen_box = QFrame()
+        gen_box.setStyleSheet("background: #F2F4F4; border-radius: 5px; padding: 5px;")
+        gen_vbox = QVBoxLayout(gen_box)
+        gen_vbox.addWidget(QLabel("<b>[General Settings]</b>"))
+        for lbl, attr, dval in [("Scale:", "txt_scale", "100"), ("H-Ext (mm):", "txt_ext", "10"),
+                                ("V-Ext (mm):", "txt_perp", "10")]:
+            h = QHBoxLayout()
+            h.addWidget(QLabel(lbl))
+            h.addStretch()
+            le = QLineEdit(dval)
+            le.setFixedWidth(self.field_width)
+            le.setStyleSheet(self.input_style)
+            setattr(self, attr, le)
+            h.addWidget(le)
+            gen_vbox.addLayout(h)
+        control_panel_layout.addWidget(gen_box)
 
-            if hasattr(self, 'mesh_cells') and self.mesh_cells:
-                cmap = matplotlib.colormaps.get_cmap('tab20')
-                for idx, poly in enumerate(self.mesh_cells):
-                    color = cmap(idx % 20)
-                    ax2.fill(*poly.exterior.xy, color=color, alpha=0.4)
-                    ax2.plot(*poly.exterior.xy, color=color, linewidth=1.5)
+        self.btn_load = QPushButton("1. DXF Load 📂")
+        self.btn_load.setFixedHeight(40)
+        self.btn_load.setStyleSheet(
+            "background-color: #00AD1D; color: white; font-weight: bold; margin-top: 5px; margin-bottom: 5px;")
+        self.btn_load.clicked.connect(self.load_and_process_dxf)
+        control_panel_layout.addWidget(self.btn_load)
 
-            if hasattr(self, 'cell_points') and self.cell_points:
-                ax2.plot([p[0] for p in self.cell_points], [p[1] for p in self.cell_points], 'ro', markersize=4,
-                         markeredgecolor='white', markeredgewidth=0.5,
-                         label=f'Points ({len(self.cell_points)})', zorder=11)
+        struct_box = QFrame()
+        struct_box.setStyleSheet("background: #FEF9E7; border-radius: 5px; padding: 5px;")
+        struct_vbox = QVBoxLayout(struct_box)
+        struct_vbox.addWidget(QLabel("<b>[Section Setting]</b>"))
 
-            h, l = ax2.get_legend_handles_labels()
-            if h: ax2.legend(loc="upper right", fontsize=8)
+        self.combo_section = QComboBox()
+        self.combo_section.addItems(["Continuous", "Discontinuous"])
+        self.combo_section.setFixedWidth(self.field_width)
+        self.combo_hull = QComboBox()
 
-        else:
-            if self.raw_1999_lines:
-                for ls in self.raw_1999_lines:
-                    ax1.plot(*ls.xy, color='black', lw=1.5)
-            for i, l in enumerate(self.left_1999_segments):
-                ax1.text(l.centroid.x, l.centroid.y, f"S{i + 1}", fontsize=10, fontweight='bold',
-                         ha='center', va='center',
-                         bbox=dict(facecolor='white', alpha=0.7, edgecolor='none'))
+        h_sec = QHBoxLayout()
+        h_sec.addWidget(QLabel("Continuity:"))
+        h_sec.addStretch()
+        h_sec.addWidget(self.combo_section)
+        struct_vbox.addLayout(h_sec)
 
-        for i in range(len(self.left_1999_segments)):
-            f = QFrame()
-            r = QHBoxLayout(f)
-            f.setStyleSheet("border-left: 4px solid #2E86C1; background: #FDFEFE; margin-bottom: 2px;")
-            r.addWidget(QLabel(f"S{i + 1}:"))
-            r.addStretch()
-            edit = QLineEdit(saved[i] if i < len(saved) else "10")
-            edit.setFixedWidth(self.field_width)
-            edit.setStyleSheet(self.input_style)
-            r.addWidget(edit)
-            self.thickness_layout.addWidget(f)
-            self.shell_thickness_inputs.append(edit)
+        self.combo_section.currentTextChanged.connect(self.on_section_changed)
+        control_panel_layout.addWidget(struct_box)
 
-        for ax in [ax1, ax2]:
-            ax.set_aspect('equal')
-            ax.grid(True, lw=0.3)
-            ax.xaxis.set_major_formatter(FuncFormatter(lambda x, pos: f"{-x:g}"))
-        self.can1.draw()
-        self.can2.draw()
+        shear_box = QFrame()
+        shear_box.setStyleSheet("background: #EBF5FB; border-radius: 5px; padding: 5px; margin-top: 10px;")
+        shear_vbox = QVBoxLayout(shear_box)
+        shear_vbox.addWidget(QLabel("<b>[Loading Setting]</b>"))
+        # Grade (K)를 제외한 S.W.B.M과 Shear만 루프로 생성
+        for lbl, attr, dval in [("S.W.B.M (tm):", "txt_swbm", ""), ("Shear (t):", "txt_shear_v", "")]:
+            h = QHBoxLayout()
+            h.addWidget(QLabel(lbl))
+            h.addStretch()
+            le = QLineEdit(dval)
+            le.setFixedWidth(self.field_width)
+            le.setStyleSheet(self.input_style)
+            setattr(self, attr, le)
+            h.addWidget(le)
+            shear_vbox.addLayout(h)
+        control_panel_layout.addWidget(shear_box)
+
+        control_panel_layout.addWidget(QLabel("<b>[S/SHELL Thickness (mm)]</b>"))
+        self.thickness_scroll = QScrollArea()
+        self.thickness_scroll.setWidgetResizable(True)
+        self.thickness_scroll.setMinimumHeight(200)
+        self.scroll_content = QWidget()
+        self.thickness_layout = QVBoxLayout(self.scroll_content)
+        self.thickness_layout.setAlignment(Qt.AlignTop)
+        self.thickness_scroll.setWidget(self.scroll_content)
+        control_panel_layout.addWidget(self.thickness_scroll)
+
+        self.btn_calc = QPushButton("2. Calculate 🧮")
+        self.btn_calc.setFixedHeight(50)
+        self.btn_calc.setStyleSheet(
+            "background-color: #00AD1D; color: white; font-weight: bold; font-size: 14px; margin-top: 5px;")
+        self.btn_calc.clicked.connect(self.calculate_total_inertia)
+        control_panel_layout.addWidget(self.btn_calc)
+
+        # [Post-Calc Evaluation] 박스 - Continuity, Hull Type, Grade (K), Material 통합
+        eval_box = QFrame()
+        eval_box.setStyleSheet("background: #FADBD8; border-radius: 5px; padding: 5px; margin-top: 10px;")
+        eval_vbox = QVBoxLayout(eval_box)
+        eval_vbox.addWidget(QLabel("<b>[Strength Anaysis settiong]</b>"))
+
+        # Hull Type 설정
+        self.combo_hull = QComboBox()
+        self.combo_hull.addItems(["S/H", "D/H"])
+        self.combo_hull.setFixedWidth(self.field_width)
+        self.combo_hull.setEnabled(False)
+        h_hull = QHBoxLayout()
+        h_hull.addWidget(QLabel("Hull Type:"))
+        h_hull.addStretch()
+        h_hull.addWidget(self.combo_hull)
+        eval_vbox.addLayout(h_hull)
+
+        self.combo_section.currentTextChanged.connect(self.on_section_changed)
+        # Material 설정
+        h_mat = QHBoxLayout()
+        h_mat.addWidget(QLabel("Material:"))
+        h_mat.addStretch()
+        self.combo_material_type = QComboBox()
+        self.combo_material_type.addItems(["Mild", "H.T", "H.T with BKT"])
+        self.combo_material_type.setFixedWidth(self.field_width)
+        h_mat.addWidget(self.combo_material_type)
+        eval_vbox.addLayout(h_mat)
+
+        # Grade (K) 설정 (Loading Setting에서 이동됨)
+        h_k = QHBoxLayout()
+        h_k.addWidget(QLabel("Grade (K):"))
+        h_k.addStretch()
+        self.txt_grade_k = QLineEdit("1.00")
+        self.txt_grade_k.setFixedWidth(self.field_width)
+        self.txt_grade_k.setStyleSheet(self.input_style)
+        h_k.addWidget(self.txt_grade_k)
+        eval_vbox.addLayout(h_k)
+
+        control_panel_layout.addWidget(eval_box)
+
+        self.btn_eval = QPushButton("3. STRENGTH Analysis ⛓️")
+        self.btn_eval.setFixedHeight(40)
+        self.btn_eval.setStyleSheet("background-color: #00AD1D; color: white; font-weight: bold;")
+        self.btn_eval.setEnabled(False)
+        self.btn_eval.clicked.connect(self.evaluate_strength)
+        eval_vbox.addWidget(self.btn_eval)
+
+        control_panel_layout.addWidget(self.btn_eval)
+
+
+        main_layout.addWidget(control_panel)
+
+        work_area = QWidget()
+        work_layout = QVBoxLayout(work_area)
+        viz_splitter = QSplitter(Qt.Horizontal)
+        for i, title in enumerate(["[Cross Section View]", "[Shear Stress Heatmap]"]):
+            container = QWidget()
+            lay = QVBoxLayout(container)
+            lay.addWidget(QLabel(f"<b>{title}</b>"))
+            fig = Figure()
+            can = FigureCanvas(fig)
+            lay.addWidget(NavigationToolbar(can, self))
+            lay.addWidget(can, stretch=1)
+            setattr(self, f"fig{i + 1}", fig)
+            setattr(self, f"can{i + 1}", can)
+            viz_splitter.addWidget(container)
+        work_layout.addWidget(viz_splitter, stretch=7)
+
+        self.result_box = QTextEdit()
+        self.result_box.setReadOnly(True)
+        self.result_box.setFixedHeight(300)
+        self.result_box.setStyleSheet("font-family: 'Consolas'; font-size: 13px;")
+        work_layout.addWidget(self.result_box)
+        main_layout.addWidget(work_area, stretch=7)
+
+        history_panel = QWidget()
+        history_panel.setFixedWidth(300)
+        history_layout = QVBoxLayout(history_panel)
+        history_layout.setAlignment(Qt.AlignTop)
+        history_layout.addWidget(QLabel("<b>[Saved Frames]</b>"))
+        self.history_scroll = QScrollArea()
+        self.history_scroll.setWidgetResizable(True)
+        self.history_content = QWidget()
+        self.history_list_layout = QVBoxLayout(self.history_content)
+        self.history_list_layout.setAlignment(Qt.AlignTop)
+        self.history_scroll.setWidget(self.history_content)
+        history_layout.addWidget(self.history_scroll, stretch=1)
+
+        self.btn_save_frame = QPushButton("4. Add Frame to List 💾")
+        self.btn_save_frame.setFixedHeight(40)
+        self.btn_save_frame.setStyleSheet("background-color: #002554; color: white; font-weight: bold;")
+        self.btn_save_frame.clicked.connect(self.save_current_frame)
+        self.btn_save_frame.setEnabled(False)
+        history_layout.addWidget(self.btn_save_frame)
+
+        self.btn_export_excel = QPushButton("5. Export All to Excel 📊")
+        self.btn_export_excel.setFixedHeight(40)
+        self.btn_export_excel.setStyleSheet(
+            "background-color: #002554; color: white; font-weight: bold; margin-top: 5px;")
+        self.btn_export_excel.clicked.connect(self.export_to_excel)
+        history_layout.addWidget(self.btn_export_excel)
+
+        main_layout.addWidget(history_panel)
+        main_scroll.setWidget(main_container)
+        self.setCentralWidget(main_scroll)
